@@ -149,39 +149,46 @@ Puedes comprobar la conexión activa entre FastAPI y PostgreSQL consumiendo:
 
 ---
 
-## Estructura del Proyecto
+## 11. Estándar de Trazabilidad y Registro en Bitácora (CU-21)
 
-```text
-boveda-backend/
-│
-├── app/
-│   ├── api/
-│   │   ├── routes/
-│   │   │   ├── __init__.py
-│   │   │   └── health.py
-│   │   ├── __init__.py
-│   │   └── router.py
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── config.py
-│   │   └── database.py
-│   ├── models/
-│   ├── repositories/
-│   ├── schemas/
-│   ├── services/
-│   ├── __init__.py
-│   └── main.py
-│
-├── migrations/
-│   ├── versions/
-│   ├── env.py
-│   └── script.py.mako
-├── tests/
-├── .env.example
-├── .gitignore
-├── alembic.ini
-├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
-└── README.md
+> 🛡️ **REGLA DE ORO PARA CADA CASO DE USO:**
+> Toda acción crítica realizada en el sistema (crear/eliminar bóvedas, subir/descargar/borrar archivos, compartir accesos, iniciar sesión, cambiar contraseñas, etc.) **DEBE** registrar un evento inmutable en la tabla `EVENTO_AUDITORIA`.
+
+### Cómo registrar un evento en cualquier servicio o endpoint:
+
+Utiliza la función centralizada `log_audit_event`:
+
+```python
+from app.services.audit_service import log_audit_event
+
+# Ejemplo al ejecutar una acción:
+log_audit_event(
+    db=db,
+    user_id=current_user.id_usuario,       # UUID del usuario que ejecuta la acción
+    device_id=dispositivo.id_dispositivo,   # UUID del dispositivo (opcional)
+    accion="CREAR_BOVEDA",                 # Código único de la acción realizada
+    tipo_evento="BOVEDA",                  # Categoría: AUTENTICACION, SEGURIDAD_MFA, BOVEDA, ARCHIVO, ACCESO
+    resultado="EXITO",                     # EXITO | FALLO | DENEGADO | BLOQUEO
+    recurso_id=str(nueva_boveda.id_boveda),# ID del recurso afectado (opcional)
+    recurso_tipo="BOVEDA",                 # Tipo de recurso: BOVEDA, ARCHIVO, USUARIO, etc.
+    ip=client_ip,                          # IP del cliente
+    user_agent=user_agent,                 # User-Agent del cliente
+    detalles={                             # Diccionario JSON con metadatos contextuales
+        "nombre_boveda": nueva_boveda.nombre,
+        "algoritmo_cifrado": "AES-256-GCM",
+    },
+)
 ```
+
+### Campos oficiales del modelo UML (`EVENTO_AUDITORIA`):
+- `id_evento`: Identificador único (UUID).
+- `id_usuario`: Relación con la tabla `USUARIO`.
+- `id_dispositivo`: Relación con la tabla `DISPOSITIVO` (nullable).
+- `accion`: `VARCHAR(100)` — Código descriptivo de la acción.
+- `tipo_evento`: `VARCHAR(50)` — Categoría para filtrado y reportes.
+- `resultado`: `VARCHAR(20)` — Estado final de la operación.
+- `recurso_id` / `recurso_tipo`: Identificación del objeto manipulado.
+- `direccion_ip` / `user_agent`: Trazabilidad técnica del origen.
+- `detalles`: `JSON` — Información adicional no estructurada.
+- `fecha_evento`: `TIMESTAMP` — Timestamp UTC generado automáticamente.
+

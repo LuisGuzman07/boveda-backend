@@ -186,3 +186,7 @@ class EventoAuditoria(Base):
     fecha_evento: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+    usuario: Mapped[Optional[Usuario]] = relationship("Usuario", foreign_keys=[id_usuario], lazy="joined")
+    dispositivo: Mapped[Optional[Dispositivo]] = relationship("Dispositivo", foreign_keys=[id_dispositivo], lazy="joined")
+
