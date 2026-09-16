@@ -5,6 +5,7 @@ import uuid
 # Añadir la raíz al path
 sys.path.insert(0, os.path.realpath(os.path.join(os.path.dirname(__file__), '../..')))
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy import select
 from app.core.database import SessionLocal
 from app.core.security import get_password_hash

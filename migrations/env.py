@@ -2,9 +2,12 @@ from logging.config import fileConfig
 import sys
 import os
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy import engine_from_config
+# pyrefly: ignore [missing-import]
 from sqlalchemy import pool
 
+# pyrefly: ignore [missing-import]
 from alembic import context
 
 # Agregar la raíz del proyecto al sys.path para poder importar `app`
