@@ -11,6 +11,7 @@ from app.models.auth import (
     Sesion,
     EventoAuditoria,
 )
+from app.models.mfa import AutenticadorMfa, RecuperacionCuenta
 
 __all__ = [
     "Usuario",
@@ -21,4 +22,6 @@ __all__ = [
     "Dispositivo",
     "Sesion",
     "EventoAuditoria",
+    "AutenticadorMfa",
+    "RecuperacionCuenta",
 ]

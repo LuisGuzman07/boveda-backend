@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import (
     create_access_token,
+    create_mfa_token,
     create_refresh_token,
     decode_token,
     get_password_hash,
@@ -16,6 +17,7 @@ from app.core.security import (
 )
 from app.models.auth import Usuario
 from app.repositories.auth_repository import AuthRepository
+from app.repositories.mfa_repository import MfaRepository
 from app.schemas.auth import (
     DispositivoInfo,
     LoginRequest,
@@ -32,6 +34,7 @@ class AuthService:
     def __init__(self, db: Session):
         self.db = db
         self.repo = AuthRepository(db)
+        self.mfa_repo = MfaRepository(db)
 
     def register_user(
         self,
@@ -40,7 +43,6 @@ class AuthService:
         user_agent: Optional[str] = None,
     ) -> UsuarioRead:
         """CU-01: Registro de nuevo usuario con asignación automática del rol Miembro (RBAC)."""
-        # 1. Verificar si el correo ya está registrado
         existing_user = self.repo.get_user_by_email(request.correo)
         if existing_user:
             self.repo.create_audit_event(
@@ -56,14 +58,11 @@ class AuthService:
                 detail="Ya existe una cuenta registrada con este correo electrónico.",
             )
 
-        # 2. Obtener el rol por defecto (Miembro) para la asignación RBAC
         default_role = self.repo.get_role_by_name("Miembro")
         roles = [default_role] if default_role else []
 
-        # 3. Hashear la contraseña de forma segura
         password_hash = get_password_hash(request.password)
 
-        # 4. Crear el usuario en la BD
         new_user = self.repo.create_user(
             nombre=request.nombre,
             correo=request.correo,
@@ -71,7 +70,6 @@ class AuthService:
             roles=roles,
         )
 
-        # 5. Registrar evento en la auditoría
         self.repo.create_audit_event(
             accion="REGISTRO_USUARIO",
             tipo_evento="AUTENTICACION",
@@ -137,7 +135,6 @@ class AuthService:
             user.intentos_fallidos += 1
             detalles_audit = {"intentos": user.intentos_fallidos}
 
-            # Si alcanza el límite de intentos, bloquear cuenta
             if user.intentos_fallidos >= settings.MAX_FAILED_LOGIN_ATTEMPTS:
                 user.bloqueado_hasta = now + timedelta(minutes=settings.LOCKOUT_DURATION_MINUTES)
                 user.estado = "BLOQUEADO"
@@ -174,17 +171,34 @@ class AuthService:
             user.estado = "ACTIVO"
         self.repo.update_user(user)
 
-        # 6. Registrar o actualizar dispositivo
+        # 6. CU-02: Verificar si el usuario tiene activado el Segundo Factor (MFA)
+        active_mfa = self.mfa_repo.get_active_mfa(user.id_usuario)
+        if active_mfa:
+            mfa_pending_token = create_mfa_token(user.id_usuario)
+            self.repo.create_audit_event(
+                accion="LOGIN_MFA_SOLICITADO",
+                tipo_evento="AUTENTICACION",
+                resultado="PENDIENTE",
+                user_id=user.id_usuario,
+                ip=client_ip,
+                user_agent=user_agent,
+                detalles={"mfa_tipo": active_mfa.tipo},
+            )
+            return LoginResponse(
+                mfa_required=True,
+                mfa_token=mfa_pending_token,
+                usuario=UsuarioRead.model_validate(user),
+            )
+
+        # 7. Si NO tiene MFA, emitir tokens finales directamente
         dispositivo_info = request.dispositivo or DispositivoInfo()
         device = self.repo.get_or_create_device(user.id_usuario, dispositivo_info)
 
-        # 7. Obtener roles y permisos del usuario
         role_names: List[str] = [r.nombre for r in user.roles]
         perm_codes: List[str] = list(
             {p.codigo for r in user.roles for p in r.permisos}
         )
 
-        # 8. Generar tokens JWT
         access_token = create_access_token(
             subject=str(user.id_usuario),
             roles=role_names,
@@ -192,7 +206,6 @@ class AuthService:
         )
         refresh_token = create_refresh_token(subject=str(user.id_usuario))
 
-        # 9. Almacenar sesión en la base de datos
         refresh_hash = hash_token(refresh_token)
         refresh_expires = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
         self.repo.create_session(
@@ -202,7 +215,6 @@ class AuthService:
             expires_at=refresh_expires,
         )
 
-        # 10. Registrar evento de auditoría de inicio exitoso
         self.repo.create_audit_event(
             accion="LOGIN_EXITOSO",
             tipo_evento="AUTENTICACION",
@@ -215,6 +227,7 @@ class AuthService:
         )
 
         return LoginResponse(
+            mfa_required=False,
             access_token=access_token,
             refresh_token=refresh_token,
             token_type="bearer",
@@ -250,12 +263,10 @@ class AuthService:
                 detail="Usuario inactivo o no disponible.",
             )
 
-        # Actualizar última actividad en la sesión
         session.ultima_actividad = now
         self.db.add(session)
         self.db.commit()
 
-        # Emitir nuevo Access Token
         role_names = [r.nombre for r in user.roles]
         perm_codes = list({p.codigo for r in user.roles for p in r.permisos})
 

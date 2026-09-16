@@ -79,6 +79,22 @@ def create_refresh_token(
     return encoded_jwt
 
 
+def create_mfa_token(subject: Union[str, Any]) -> str:
+    """Genera un JWT temporal de 5 minutos para el flujo de segundo factor MFA."""
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(minutes=5)
+    to_encode: Dict[str, Any] = {
+        "sub": str(subject),
+        "iat": now,
+        "exp": expire,
+        "type": "mfa_pending",
+    }
+    encoded_jwt = jwt.encode(
+        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
+    )
+    return encoded_jwt
+
+
 def decode_token(token: str) -> Optional[Dict[str, Any]]:
     """Decodifica y valida la firma y expiración de un JWT."""
     try:

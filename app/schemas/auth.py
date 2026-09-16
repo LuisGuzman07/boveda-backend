@@ -80,7 +80,7 @@ class RegistroUsuarioRequest(BaseModel):
         return v
 
 
-# Schemas para Sesión y Autenticación
+# Schemas para Sesión y Autenticación (con soporte para MFA)
 class LoginRequest(BaseModel):
     correo: EmailStr
     password: str
@@ -92,13 +92,15 @@ class RefreshTokenRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    access_token: str
-    refresh_token: str
+    mfa_required: bool = False
+    mfa_token: Optional[str] = None
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
     token_type: str = "bearer"
-    expires_in: int
-    usuario: UsuarioRead
-    roles: List[str]
-    permisos: List[str]
+    expires_in: Optional[int] = None
+    usuario: Optional[UsuarioRead] = None
+    roles: List[str] = []
+    permisos: List[str] = []
 
 
 class SesionRead(BaseModel):
