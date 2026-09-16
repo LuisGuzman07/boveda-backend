@@ -26,6 +26,16 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "postgresql+psycopg://boveda_user:boveda_password@db:5432/boveda_db"
 
+    # JWT & Authentication
+    JWT_SECRET_KEY: str = "boveda_super_secret_jwt_key_2026_change_in_production_hybrid_vault"
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    # Security Policies
+    MAX_FAILED_LOGIN_ATTEMPTS: int = 5
+    LOCKOUT_DURATION_MINUTES: int = 15
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:

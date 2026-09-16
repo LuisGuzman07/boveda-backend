@@ -10,6 +10,7 @@ from alembic import context
 # Agregar la raíz del proyecto al sys.path para poder importar `app`
 sys.path.insert(0, os.path.realpath(os.path.join(os.path.dirname(__file__), '..')))
 
+import app.models  # noqa: F401 - Asegura el registro de todos los modelos
 from app.core.config import settings
 from app.core.database import Base
 
