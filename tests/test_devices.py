@@ -172,3 +172,133 @@ def test_delete_and_revoke_device():
     )
     assert del_res.status_code == 200
     assert del_res.json()["dispositivo"]["estado"] == "REVOCADO"
+
+
+# ==============================================================================
+# CU-05: PRUEBAS PARA REVOCACIÓN DE DISPOSITIVOS Y SESIONES ACTIVAS
+# ==============================================================================
+
+def test_revoke_device_invalidates_active_sessions():
+    """CU-05: Comprueba que al revocar un dispositivo, sus sesiones activas se invalidan de inmediato."""
+    from app.models.auth import Sesion
+    secure_id = f"dev-sesion-test-{uuid.uuid4().hex[:8]}"
+
+    # Iniciar sesión vinculando este dispositivo
+    login_res = client.post(
+        "/api/v1/auth/login",
+        json={
+            "correo": "admin@boveda.com",
+            "password": "Admin1234!*",
+            "dispositivo": {
+                "nombre": "Terminal Sesión Test",
+                "tipo": "DESKTOP",
+                "identificador_seguro": secure_id,
+            },
+        },
+    )
+    assert login_res.status_code == 200
+    token = login_res.json()["access_token"]
+
+    # Verificar que el dispositivo existe y tiene sesión activa
+    db = SessionLocal()
+    try:
+        dev = db.scalars(select(Dispositivo).where(Dispositivo.identificador_seguro == secure_id)).first()
+        assert dev is not None
+        device_id = str(dev.id_dispositivo)
+
+        sesion_activa = db.scalars(
+            select(Sesion).where(
+                Sesion.id_dispositivo == dev.id_dispositivo,
+                Sesion.revocada == False,
+            )
+        ).first()
+        assert sesion_activa is not None
+
+        # CU-05: Revocar el dispositivo mediante DELETE /devices/{id}
+        del_res = client.delete(
+            f"/api/v1/devices/{device_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert del_res.status_code == 200
+
+        # Comprobar en base de datos que la sesión se marcó como revocada
+        db.expire_all()
+        sesion_revocada = db.scalars(
+            select(Sesion).where(Sesion.id_dispositivo == dev.id_dispositivo)
+        ).first()
+        assert sesion_revocada is not None
+        assert sesion_revocada.revocada is True
+        assert "DISPOSITIVO_DESVINCULADO" in sesion_revocada.motivo_revocacion
+    finally:
+        db.close()
+
+
+def test_admin_list_and_revoke_member_device():
+    """CU-05: El Administrador puede auditar todos los dispositivos y revocar el de otro usuario."""
+    # 1. Login como Miembro para crear un dispositivo
+    member_email = f"miembro_dev_{uuid.uuid4().hex[:8]}@boveda.com"
+    client.post(
+        "/api/v1/auth/register",
+        json={"nombre": "Miembro Test", "correo": member_email, "password": "PasswordFuerte123!*"},
+    )
+    member_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "correo": member_email,
+            "password": "PasswordFuerte123!*",
+            "dispositivo": {
+                "nombre": "Laptop Miembro Vulnerable",
+                "tipo": "DESKTOP",
+                "identificador_seguro": f"sec-member-{uuid.uuid4().hex[:8]}",
+            },
+        },
+    )
+    member_token = member_login.json()["access_token"]
+
+    # 2. Login como Admin
+    admin_token, _ = _get_auth_tokens()
+
+    # 3. El Miembro NO puede acceder al endpoint de administración (403)
+    forbidden_res = client.get(
+        "/api/v1/devices/admin/all",
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert forbidden_res.status_code == 403
+
+    # 4. El Administrador SI puede listar todos los dispositivos globales
+    admin_list_res = client.get(
+        "/api/v1/devices/admin/all",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert admin_list_res.status_code == 200
+    all_devices = admin_list_res.json()["dispositivos"]
+    assert len(all_devices) > 0
+
+    target = next((d for d in all_devices if d["usuario_correo"] == member_email), None)
+    assert target is not None
+    target_device_id = target["id_dispositivo"]
+
+    # 5. El Administrador revoca forzadamente el dispositivo del Miembro
+    revoke_res = client.post(
+        f"/api/v1/devices/admin/{target_device_id}/revoke",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"motivo": "Sospecha de acceso indebido reportado"},
+    )
+    assert revoke_res.status_code == 200
+    assert revoke_res.json()["status"] == "ok"
+    assert revoke_res.json()["dispositivo"]["estado"] == "REVOCADO"
+
+    # 6. Verificar evento de auditoría en la base de datos
+    db = SessionLocal()
+    try:
+        audit_event = db.scalars(
+            select(EventoAuditoria).where(
+                EventoAuditoria.accion == "REVOCACION_DISPOSITIVO_ADMIN",
+                EventoAuditoria.id_dispositivo == uuid.UUID(target_device_id),
+            )
+        ).first()
+        assert audit_event is not None
+        assert audit_event.resultado == "EXITO"
+        assert "Sospecha de acceso indebido" in str(audit_event.detalles)
+    finally:
+        db.close()

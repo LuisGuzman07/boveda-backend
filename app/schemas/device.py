@@ -45,3 +45,39 @@ class DeviceActionResponse(BaseModel):
     status: str = "ok"
     message: str
     dispositivo: DeviceRead
+
+
+# --- CU-05: Schemas Administrativos para Revocación y Control Global ---
+
+class AdminDeviceRevokeRequest(BaseModel):
+    motivo: str = Field(
+        "Revocación de seguridad por el administrador",
+        min_length=3,
+        max_length=255,
+        description="Motivo registrado en auditoría para revocar el dispositivo y sus sesiones asociadas",
+    )
+
+
+class AdminDeviceRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id_dispositivo: uuid.UUID
+    id_usuario: uuid.UUID
+    usuario_nombre: str
+    usuario_correo: str
+    nombre: Optional[str] = None
+    tipo: Optional[str] = None
+    sistema_operativo: Optional[str] = None
+    identificador_seguro: str
+    es_confiable: bool
+    estado: str
+    fecha_registro: datetime
+    ultimo_acceso: datetime
+    fecha_revocacion: Optional[datetime] = None
+    revocado_por: Optional[uuid.UUID] = None
+    sesiones_activas: int = 0
+
+
+class AdminDeviceListResponse(BaseModel):
+    total: int
+    dispositivos: List[AdminDeviceRead]

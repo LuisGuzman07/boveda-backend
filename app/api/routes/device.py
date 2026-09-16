@@ -143,3 +143,90 @@ def delete_device(
         client_ip=client_ip,
         user_agent=user_agent,
     )
+
+
+# ==============================================================================
+# CU-05: ENDPOINTS ADMINISTRATIVOS (ACTOR: ADMINISTRADOR)
+# ==============================================================================
+
+def verify_admin_role(current_user: Usuario = Depends(get_current_user)) -> Usuario:
+    """Verifica que el usuario solicitante posea el rol de Administrador."""
+    roles = [r.nombre for r in current_user.roles]
+    if "Administrador" not in roles:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acceso restringido: Se requieren privilegios de Administrador para gestionar terminales globales.",
+        )
+    return current_user
+
+
+@router.get(
+    "/admin/all",
+    summary="CU-05: Inventario global de terminales (Admin)",
+    description="Permite a los administradores auditar todos los dispositivos registrados en la plataforma con estado y sesiones activas.",
+)
+def list_all_devices_admin(
+    query: Optional[str] = None,
+    solo_confiables: Optional[bool] = None,
+    estado: Optional[str] = None,
+    current_user: Usuario = Depends(verify_admin_role),
+    db: Session = Depends(get_db),
+):
+    service = DeviceService(db)
+    return service.list_all_devices_admin(
+        query=query,
+        solo_confiables=solo_confiables,
+        estado=estado,
+    )
+
+
+@router.post(
+    "/admin/{device_id}/revoke",
+    response_model=DeviceActionResponse,
+    summary="CU-05: Revocación administrativa forzada de dispositivo y sesiones",
+    description="Invalida de inmediato la terminal de cualquier usuario y cierra todas sus sesiones activas ante incidentes de seguridad.",
+)
+def revoke_device_admin(
+    device_id: uuid.UUID,
+    request: Request,
+    body: Optional[dict] = None,
+    current_user: Usuario = Depends(verify_admin_role),
+    db: Session = Depends(get_db),
+):
+    service = DeviceService(db)
+    client_ip = get_client_ip(request)
+    user_agent = request.headers.get("User-Agent", "Desconocido")
+    motivo = (body or {}).get("motivo", "Revocación administrativa preventiva de seguridad")
+    return service.revoke_device_admin(
+        device_id=device_id,
+        admin_user=current_user,
+        motivo=motivo,
+        client_ip=client_ip,
+        user_agent=user_agent,
+    )
+
+
+@router.post(
+    "/admin/user/{target_user_id}/revoke-all",
+    summary="CU-05: Expulsión total de terminales de una cuenta (Admin)",
+    description="Revoca todas las terminales y sesiones activas de un usuario ante compromiso de cuenta o sospecha de ataque.",
+)
+def revoke_all_user_devices_admin(
+    target_user_id: uuid.UUID,
+    request: Request,
+    body: Optional[dict] = None,
+    current_user: Usuario = Depends(verify_admin_role),
+    db: Session = Depends(get_db),
+):
+    service = DeviceService(db)
+    client_ip = get_client_ip(request)
+    user_agent = request.headers.get("User-Agent", "Desconocido")
+    motivo = (body or {}).get("motivo", "Revocación masiva de terminales por compromiso de cuenta")
+    return service.revoke_all_user_devices_admin(
+        target_user_id=target_user_id,
+        admin_user=current_user,
+        motivo=motivo,
+        client_ip=client_ip,
+        user_agent=user_agent,
+    )
