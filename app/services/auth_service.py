@@ -192,6 +192,8 @@ class AuthService:
 
         # 7. Si NO tiene MFA, emitir tokens finales directamente
         dispositivo_info = request.dispositivo or DispositivoInfo()
+        if request.confiar_dispositivo is not None:
+            dispositivo_info.confiar_dispositivo = request.confiar_dispositivo
         device = self.repo.get_or_create_device(user.id_usuario, dispositivo_info)
 
         role_names: List[str] = [r.nombre for r in user.roles]

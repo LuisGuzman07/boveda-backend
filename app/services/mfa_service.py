@@ -222,6 +222,8 @@ class MfaService:
         # 3. Éxito: Crear sesión y emitir JWTs finales
         now = datetime.now(timezone.utc)
         device_info = request.dispositivo or DispositivoInfo()
+        if request.confiar_dispositivo is not None:
+            device_info.confiar_dispositivo = request.confiar_dispositivo
         device = self.auth_repo.get_or_create_device(user.id_usuario, device_info)
 
         role_names = [r.nombre for r in user.roles]

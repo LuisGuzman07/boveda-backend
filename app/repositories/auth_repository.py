@@ -72,6 +72,12 @@ class AuthRepository:
                 device.nombre = info.nombre
             if info.sistema_operativo:
                 device.sistema_operativo = info.sistema_operativo
+            if info.public_key:
+                device.public_key = info.public_key
+            if getattr(info, "confiar_dispositivo", False):
+                device.es_confiable = True
+            if device.estado == "REVOCADO":
+                device.estado = "ACTIVO"
         else:
             device = Dispositivo(
                 id_usuario=user_id,
@@ -79,7 +85,8 @@ class AuthRepository:
                 tipo=info.tipo,
                 sistema_operativo=info.sistema_operativo,
                 identificador_seguro=info.identificador_seguro or str(uuid.uuid4()),
-                es_confiable=False,
+                public_key=getattr(info, "public_key", None),
+                es_confiable=bool(getattr(info, "confiar_dispositivo", False)),
                 estado="ACTIVO",
             )
             self.db.add(device)
