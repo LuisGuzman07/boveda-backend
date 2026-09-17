@@ -19,6 +19,7 @@ class MfaVerifyLoginRequest(BaseModel):
     mfa_token: str
     code: str = Field(..., min_length=6, max_length=12, description="Código de 6 dígitos de la app o código de respaldo")
     dispositivo: Optional[DispositivoInfo] = Field(default_factory=DispositivoInfo)
+    confiar_dispositivo: Optional[bool] = None
 
 
 class MfaDisableRequest(BaseModel):

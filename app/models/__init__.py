@@ -12,6 +12,7 @@ from app.models.auth import (
     EventoAuditoria,
 )
 from app.models.mfa import AutenticadorMfa, RecuperacionCuenta
+from app.models.vault import Boveda, MembresiaBoveda, ClaveEnvuelta
 
 __all__ = [
     "Usuario",
@@ -24,4 +25,7 @@ __all__ = [
     "EventoAuditoria",
     "AutenticadorMfa",
     "RecuperacionCuenta",
+    "Boveda",
+    "MembresiaBoveda",
+    "ClaveEnvuelta",
 ]

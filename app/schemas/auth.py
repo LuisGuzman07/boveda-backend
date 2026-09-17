@@ -30,6 +30,8 @@ class DispositivoInfo(BaseModel):
     tipo: Optional[str] = "WEB"
     sistema_operativo: Optional[str] = "Desconocido"
     identificador_seguro: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()))
+    public_key: Optional[str] = None
+    confiar_dispositivo: bool = False
 
 
 class DispositivoRead(BaseModel):
@@ -85,6 +87,7 @@ class LoginRequest(BaseModel):
     correo: EmailStr
     password: str
     dispositivo: Optional[DispositivoInfo] = Field(default_factory=DispositivoInfo)
+    confiar_dispositivo: Optional[bool] = None
 
 
 class RefreshTokenRequest(BaseModel):
