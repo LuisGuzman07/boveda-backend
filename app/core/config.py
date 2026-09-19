@@ -1,7 +1,19 @@
-from typing import List, Union
+from typing import List, Literal, Union
 import json
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+MINIMUM_JWT_SECRET_LENGTH = 32
+MINIMUM_JWT_SECRET_UNIQUE_CHARACTERS = 12
+INSECURE_JWT_SECRET_VALUES = frozenset(
+    {
+        "boveda_super_secret_jwt_key_2026_change_in_production_hybrid_vault",
+        "change-me",
+        "your-jwt-secret",
+        "replace_with_a_secret_generated_outside_this_repository",
+    }
+)
 
 
 class Settings(BaseSettings):
@@ -27,8 +39,8 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+psycopg://boveda_user:boveda_password@db:5432/boveda_db"
 
     # JWT & Authentication
-    JWT_SECRET_KEY: str = "boveda_super_secret_jwt_key_2026_change_in_production_hybrid_vault"
-    JWT_ALGORITHM: str = "HS256"
+    JWT_SECRET_KEY: SecretStr
+    JWT_ALGORITHM: Literal["HS256"] = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
@@ -57,6 +69,22 @@ class Settings(BaseSettings):
                     pass
             return [i.strip() for i in v.split(",") if i.strip()]
         return v
+
+    @field_validator("JWT_SECRET_KEY")
+    @classmethod
+    def validate_jwt_secret(cls, value: SecretStr) -> SecretStr:
+        secret = value.get_secret_value().strip()
+        if not secret:
+            raise ValueError("JWT_SECRET_KEY must not be empty.")
+        if len(secret) < MINIMUM_JWT_SECRET_LENGTH:
+            raise ValueError(
+                f"JWT_SECRET_KEY must contain at least {MINIMUM_JWT_SECRET_LENGTH} characters."
+            )
+        if secret.lower() in INSECURE_JWT_SECRET_VALUES:
+            raise ValueError("JWT_SECRET_KEY uses a known insecure example value.")
+        if len(set(secret)) < MINIMUM_JWT_SECRET_UNIQUE_CHARACTERS:
+            raise ValueError("JWT_SECRET_KEY does not contain enough entropy.")
+        return SecretStr(secret)
 
 
 settings = Settings()

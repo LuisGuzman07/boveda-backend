@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import decode_token, hash_token
+from app.core.security import decode_token, get_jwt_secret, hash_token
 from app.models.auth import Dispositivo, Sesion, Usuario
 from app.models.mfa import AutenticadorMfa
 from app.schemas.vault import VaultSessionRequest
@@ -60,7 +60,7 @@ def issue_vault_session(db: Session, user: Usuario, body: VaultSessionRequest):
     except Exception:
         reject(422, "Clave pública Ed25519 inválida.")
     now = datetime.now(timezone.utc)
-    token = jwt.encode({"sub": str(user.id_usuario), "sid": str(session.id_sesion), "did": str(session.id_dispositivo), "pk": body.public_key, "mfa": True, "type": "vault_access", "jti": str(uuid.uuid4()), "iat": now, "exp": now + timedelta(minutes=15)}, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    token = jwt.encode({"sub": str(user.id_usuario), "sid": str(session.id_sesion), "did": str(session.id_dispositivo), "pk": body.public_key, "mfa": True, "type": "vault_access", "jti": str(uuid.uuid4()), "iat": now, "exp": now + timedelta(minutes=15)}, get_jwt_secret(), algorithm=settings.JWT_ALGORITHM)
     return {"access_token": token, "id_dispositivo": str(session.id_dispositivo), "id_usuario": str(user.id_usuario), "expires_in": 900}
 
 

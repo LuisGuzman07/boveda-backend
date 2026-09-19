@@ -50,6 +50,7 @@ class MfaRepository:
         # Invalidar códigos anteriores no utilizados
         old_stmt = select(RecuperacionCuenta).where(
             RecuperacionCuenta.id_usuario == user_id,
+            RecuperacionCuenta.tipo == "BACKUP_CODE",
             RecuperacionCuenta.utilizado == False,
         )
         for old in self.db.scalars(old_stmt).all():
@@ -79,6 +80,7 @@ class MfaRepository:
         stmt = select(RecuperacionCuenta).where(
             RecuperacionCuenta.id_usuario == user_id,
             RecuperacionCuenta.token_hash == code_hash,
+            RecuperacionCuenta.tipo == "BACKUP_CODE",
             RecuperacionCuenta.utilizado == False,
         )
         record = self.db.scalars(stmt).first()

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from app.core.config import settings
 from app.core.database import Base, get_db
-from app.core.security import create_access_token, create_refresh_token, get_password_hash, hash_token
+from app.core.security import create_access_token, create_refresh_token, get_jwt_secret, get_password_hash, hash_token
 from app.main import app
 from app.models.auth import Dispositivo, EventoAuditoria, Permiso, Rol, Sesion, Usuario
 from app.models.mfa import AutenticadorMfa
@@ -84,7 +84,7 @@ def signed_request(environment, method, path, body=None, retry_key="cu06-retry-k
     client, _, _, _, _, signing_key, token = environment
     text = json.dumps(body, separators=(",", ":")) if body is not None else ""
     timestamp = str(timestamp if timestamp is not None else int(time.time()))
-    payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    payload = jwt.decode(token, get_jwt_secret(), algorithms=[settings.JWT_ALGORITHM])
     message = "\n".join([payload["jti"], timestamp, method, path, retry_key, hashlib.sha256(text.encode()).hexdigest()]).encode()
     headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json", "Idempotency-Key": retry_key, "X-Vault-Timestamp": timestamp, "X-Vault-Signature": base64.b64encode(signing_key.sign(message)).decode()}
     return client.request(method, path, headers=headers, content=text)

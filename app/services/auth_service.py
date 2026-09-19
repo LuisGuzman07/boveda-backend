@@ -30,6 +30,10 @@ from app.schemas.auth import (
 security_scheme = HTTPBearer(auto_error=True)
 
 
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    return value.replace(tzinfo=timezone.utc) if value and value.tzinfo is None else value
+
+
 class AuthService:
     def __init__(self, db: Session):
         self.db = db
@@ -107,8 +111,9 @@ class AuthService:
             )
 
         # 2. Validar si la cuenta está bloqueada
-        if user.bloqueado_hasta and user.bloqueado_hasta > now:
-            minutos_restantes = int((user.bloqueado_hasta - now).total_seconds() / 60) + 1
+        bloqueado_hasta = _as_utc(user.bloqueado_hasta)
+        if bloqueado_hasta and bloqueado_hasta > now:
+            minutos_restantes = int((bloqueado_hasta - now).total_seconds() / 60) + 1
             self.repo.create_audit_event(
                 accion="LOGIN_BLOQUEADO",
                 tipo_evento="AUTENTICACION",
@@ -252,7 +257,8 @@ class AuthService:
         token_hash = hash_token(request.refresh_token)
         session = self.repo.get_session_by_token_hash(token_hash)
 
-        if not session or session.revocada or session.fecha_expiracion <= now:
+        session_expiration = _as_utc(session.fecha_expiracion) if session else None
+        if not session or session.revocada or session_expiration is None or session_expiration <= now:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Sesión expirada o revocada.",

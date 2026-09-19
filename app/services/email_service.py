@@ -18,16 +18,11 @@ def send_recovery_email(
     Retorna True si el correo se despachó exitosamente vía SMTP, o False si está
     en modo simulación o si falló la conexión con el servidor de correo.
     """
-    reset_url = f"{settings.FRONTEND_URL}/reset-password?token={reset_token}"
+    reset_url = f"{settings.FRONTEND_URL.rstrip('/')}/reset-password#token={reset_token}"
     from_email = settings.SMTP_FROM_EMAIL or settings.SMTP_USER
 
-    # Si SMTP no está habilitado o no hay credenciales configuradas
     if not settings.SMTP_ENABLED or not settings.SMTP_USER or not settings.SMTP_PASSWORD:
-        logger.info(
-            f"📧 [MODO SIMULACIÓN] Correo no enviado por falta de credenciales SMTP en .env.\n"
-            f"   Destinatario: {to_email}\n"
-            f"   Enlace de prueba: {reset_url}"
-        )
+        logger.error("Recovery email delivery is unavailable because SMTP is not configured.")
         return False
 
     try:
@@ -148,9 +143,9 @@ def send_recovery_email(
         server.sendmail(from_email, [to_email], msg.as_string())
         server.quit()
 
-        logger.info(f"✅ Correo de recuperación enviado exitosamente a {to_email} vía SMTP.")
+        logger.info("Recovery email delivered.")
         return True
 
-    except Exception as e:
-        logger.error(f"❌ Error al enviar correo de recuperación a {to_email} vía SMTP: {e}")
+    except Exception:
+        logger.error("Recovery email delivery failed.")
         return False

@@ -47,6 +47,14 @@ POSTGRES_PORT=5432
 DATABASE_URL=postgresql+psycopg://boveda_user:boveda_password@db:5432/boveda_db
 ```
 
+`JWT_SECRET_KEY` is required and has no default value. Generate a local value of at least 32 characters before starting the API:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Store the result only in the local environment or `.env` file. Do not use the `.env.example` placeholder, log it, or commit it.
+
 > ⚠️ **IMPORTANTE:** El archivo `.env` nunca debe subirse al repositorio de Git.
 
 ---

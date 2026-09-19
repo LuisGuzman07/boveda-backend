@@ -12,17 +12,13 @@ class ForgotPasswordRequest(BaseModel):
 class ForgotPasswordResponse(BaseModel):
     status: str = "ok"
     message: str
-    expires_in_minutes: int = 15
-    email_sent: bool = False
-    # En desarrollo/pruebas académicas se expone el token/url para simulación directa si no hay SMTP
-    simulation_token: Optional[str] = None
-    simulation_reset_url: Optional[str] = None
 
 
+class ValidateTokenRequest(BaseModel):
+    token: str = Field(..., min_length=10, description="Token received through the recovery email")
 
 class ValidateTokenResponse(BaseModel):
     valid: bool
-    correo: Optional[str] = None
     message: str
 
 

@@ -29,6 +29,11 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def get_jwt_secret() -> str:
+    """Returns the validated JWT key without exposing it in configuration reprs."""
+    return settings.JWT_SECRET_KEY.get_secret_value()
+
+
 def create_access_token(
     subject: Union[str, Any],
     roles: Optional[List[str]] = None,
@@ -51,7 +56,7 @@ def create_access_token(
         "type": "access",
     }
     encoded_jwt = jwt.encode(
-        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
+        to_encode, get_jwt_secret(), algorithm=settings.JWT_ALGORITHM
     )
     return encoded_jwt
 
@@ -74,7 +79,7 @@ def create_refresh_token(
         "type": "refresh",
     }
     encoded_jwt = jwt.encode(
-        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
+        to_encode, get_jwt_secret(), algorithm=settings.JWT_ALGORITHM
     )
     return encoded_jwt
 
@@ -90,7 +95,7 @@ def create_mfa_token(subject: Union[str, Any]) -> str:
         "type": "mfa_pending",
     }
     encoded_jwt = jwt.encode(
-        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
+        to_encode, get_jwt_secret(), algorithm=settings.JWT_ALGORITHM
     )
     return encoded_jwt
 
@@ -100,7 +105,7 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
     try:
         payload = jwt.decode(
             token,
-            settings.JWT_SECRET_KEY,
+            get_jwt_secret(),
             algorithms=[settings.JWT_ALGORITHM],
         )
         return payload
