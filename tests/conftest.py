@@ -1,3 +1,4 @@
+import base64
 import os
 import secrets
 
@@ -8,6 +9,9 @@ from sqlalchemy.pool import StaticPool
 
 # Pytest injects an isolated value before importing application settings.
 os.environ["JWT_SECRET_KEY"] = secrets.token_urlsafe(48)
+os.environ["TOTP_ENCRYPTION_KEY"] = base64.urlsafe_b64encode(
+    secrets.token_bytes(32)
+).decode("ascii")
 if os.getenv("CU06_TEST_POSTGRES") != "1":
     os.environ["DATABASE_URL"] = "sqlite://"
 

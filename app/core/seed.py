@@ -126,7 +126,7 @@ def seed_database():
                 roles=[roles_map["Administrador"]],
             )
             db.add(admin_user)
-            print(f"  + Usuario Administrador creado: {admin_email} (Contraseña: Admin1234!*)")
+            print("Usuario administrador local creado.")
 
         # 4. Usuario Miembro de Prueba
         user_email = "investigador@boveda.com"
@@ -145,7 +145,7 @@ def seed_database():
                 roles=[roles_map["Miembro"]],
             )
             db.add(test_user)
-            print(f"  + Usuario Miembro creado: {user_email} (Contraseña: User1234!*)")
+            print("Usuario miembro local creado.")
 
         db.commit()
         print("✅ Siembra de datos completada exitosamente.")

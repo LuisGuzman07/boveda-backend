@@ -42,6 +42,14 @@ def test_settings_accepts_an_explicit_valid_jwt_secret(monkeypatch):
     assert configured.JWT_SECRET_KEY.get_secret_value() == secret
 
 
+def test_settings_rejects_missing_totp_encryption_key(monkeypatch):
+    monkeypatch.setenv("JWT_SECRET_KEY", secrets.token_urlsafe(48))
+    monkeypatch.delenv("TOTP_ENCRYPTION_KEY", raising=False)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
 def test_pytest_injected_secret_initializes_all_jwt_types():
     assert len(get_jwt_secret()) >= 32
 

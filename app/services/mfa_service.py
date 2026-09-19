@@ -20,6 +20,7 @@ from app.models.auth import Usuario
 from app.models.mfa import AutenticadorMfa
 from app.repositories.auth_repository import AuthRepository
 from app.repositories.mfa_repository import MfaRepository
+from app.services.totp_secret_service import get_totp_secret, store_encrypted_totp_secret
 from app.schemas.auth import DispositivoInfo, LoginResponse, UsuarioRead
 from app.schemas.mfa import (
     MfaDisableRequest,
@@ -69,14 +70,14 @@ class MfaService:
 
         # 4. Generar 8 códigos de respaldo (formato XXXX-XXXX)
         backup_codes: List[str] = [
-            f"{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
+            f"{secrets.token_hex(8).upper()}-{secrets.token_hex(8).upper()}"
             for _ in range(8)
         ]
 
         # 5. Guardar autenticador en estado PENDIENTE
         existing_mfa = self.mfa_repo.get_pending_or_active_mfa(user.id_usuario)
         if existing_mfa:
-            existing_mfa.secreto_cifrado = secret
+            store_encrypted_totp_secret(existing_mfa, secret)
             existing_mfa.estado = "PENDIENTE"
             self.mfa_repo.save_mfa(existing_mfa)
         else:
@@ -84,9 +85,9 @@ class MfaService:
                 id_autenticador=uuid.uuid4(),
                 id_usuario=user.id_usuario,
                 tipo="TOTP",
-                secreto_cifrado=secret,
                 estado="PENDIENTE",
             )
+            store_encrypted_totp_secret(new_mfa, secret)
             self.mfa_repo.save_mfa(new_mfa)
 
         # 6. Guardar códigos de respaldo
@@ -125,7 +126,7 @@ class MfaService:
                 detail="No hay una configuración de MFA pendiente. Inicie el proceso primero.",
             )
 
-        totp = pyotp.TOTP(mfa.secreto_cifrado)
+        totp = pyotp.TOTP(get_totp_secret(mfa))
         if not totp.verify(request.code.strip(), valid_window=1):
             self.auth_repo.create_audit_event(
                 accion="MFA_ACTIVACION_FALLIDA",
@@ -192,7 +193,7 @@ class MfaService:
         method_used = "TOTP"
 
         if len(code_input) == 6 and code_input.isdigit():
-            totp = pyotp.TOTP(mfa.secreto_cifrado)
+            totp = pyotp.TOTP(get_totp_secret(mfa))
             if totp.verify(code_input, valid_window=1):
                 is_valid = True
                 mfa.ultimo_uso = datetime.now(timezone.utc)

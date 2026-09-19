@@ -16,6 +16,7 @@ from app.core.security import decode_token, get_jwt_secret, hash_token
 from app.models.auth import Dispositivo, Sesion, Usuario
 from app.models.mfa import AutenticadorMfa
 from app.schemas.vault import VaultSessionRequest
+from app.services.totp_secret_service import get_totp_secret
 
 vault_bearer = HTTPBearer(auto_error=False)
 
@@ -52,7 +53,7 @@ def issue_vault_session(db: Session, user: Usuario, body: VaultSessionRequest):
     if device.public_key != body.public_key:
         reject(403, "La clave de firma no corresponde al dispositivo registrado.")
     mfa = db.scalar(select(AutenticadorMfa).where(AutenticadorMfa.id_usuario == user.id_usuario, AutenticadorMfa.estado == "ACTIVO", AutenticadorMfa.tipo == "TOTP"))
-    if not mfa or not pyotp.TOTP(mfa.secreto_cifrado).verify(body.code, valid_window=1):
+    if not mfa or not pyotp.TOTP(get_totp_secret(mfa)).verify(body.code, valid_window=1):
         reject(403, "Se requiere un código TOTP válido para abrir la sesión de bóvedas.")
     try:
         public_key = base64.b64decode(body.public_key, validate=True)

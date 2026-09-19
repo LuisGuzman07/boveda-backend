@@ -21,6 +21,7 @@ from app.main import app
 from app.models.auth import Dispositivo, EventoAuditoria, Permiso, Rol, Sesion, Usuario
 from app.models.mfa import AutenticadorMfa
 from app.models.vault import Boveda, ClaveEnvuelta, MembresiaBoveda
+from app.services.totp_secret_service import get_totp_secret, store_encrypted_totp_secret
 
 
 @pytest.fixture
@@ -60,7 +61,9 @@ def environment(vault_engine):
     refresh = create_refresh_token(user.id_usuario)
     session = Sesion(id_sesion=uuid.uuid4(), id_usuario=user.id_usuario, id_dispositivo=device.id_dispositivo, refresh_token_hash=hash_token(refresh), fecha_expiracion=datetime.now(timezone.utc) + timedelta(days=1))
     secret = pyotp.random_base32()
-    db.add_all([device, session, AutenticadorMfa(id_usuario=user.id_usuario, tipo="TOTP", secreto_cifrado=secret, estado="ACTIVO")])
+    mfa = AutenticadorMfa(id_usuario=user.id_usuario, tipo="TOTP", estado="ACTIVO")
+    store_encrypted_totp_secret(mfa, secret)
+    db.add_all([device, session, mfa])
     db.commit()
     app.dependency_overrides[get_db] = lambda: db
     client = TestClient(app)
@@ -185,7 +188,7 @@ def test_existing_login_mfa_device_flow_opens_vault_session(environment):
     login = client.post("/api/v1/auth/login", json={"correo": user.correo, "password": "Cu06Test123!*", "dispositivo": device_info})
     assert login.status_code == 200, login.text
     assert login.json()["mfa_required"] is True
-    code = pyotp.TOTP(mfa.secreto_cifrado).now()
+    code = pyotp.TOTP(get_totp_secret(mfa)).now()
     verified = client.post("/api/v1/auth/mfa/verify-login", json={"mfa_token": login.json()["mfa_token"], "code": code, "dispositivo": device_info, "confiar_dispositivo": True})
     assert verified.status_code == 200, verified.text
     tokens = verified.json()
@@ -203,7 +206,7 @@ def test_vault_session_rejects_missing_mfa_and_unregistered_key(environment):
     session.refresh_token_hash = hash_token(token)
     db.commit()
     headers = {"Authorization": "Bearer " + create_access_token(user.id_usuario)}
-    body = {"refresh_token": token, "code": pyotp.TOTP(mfa.secreto_cifrado).now(), "public_key": base64.b64encode(bytes(32)).decode()}
+    body = {"refresh_token": token, "code": pyotp.TOTP(get_totp_secret(mfa)).now(), "public_key": base64.b64encode(bytes(32)).decode()}
     assert client.post("/api/v1/vaults/session", headers=headers, json=body).status_code == 403
     body["public_key"] = device.public_key
     mfa.estado = "INACTIVO"

@@ -1,3 +1,5 @@
+import base64
+import binascii
 from typing import List, Literal, Union
 import json
 from pydantic import SecretStr, field_validator
@@ -6,6 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 MINIMUM_JWT_SECRET_LENGTH = 32
 MINIMUM_JWT_SECRET_UNIQUE_CHARACTERS = 12
+TOTP_ENCRYPTION_KEY_BYTES = 32
 INSECURE_JWT_SECRET_VALUES = frozenset(
     {
         "boveda_super_secret_jwt_key_2026_change_in_production_hybrid_vault",
@@ -43,6 +46,9 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: Literal["HS256"] = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    # AES-256-GCM key encoded as URL-safe base64. It has no fallback by design.
+    TOTP_ENCRYPTION_KEY: SecretStr
 
     # Security Policies
     MAX_FAILED_LOGIN_ATTEMPTS: int = 5
@@ -85,6 +91,27 @@ class Settings(BaseSettings):
         if len(set(secret)) < MINIMUM_JWT_SECRET_UNIQUE_CHARACTERS:
             raise ValueError("JWT_SECRET_KEY does not contain enough entropy.")
         return SecretStr(secret)
+
+    @field_validator("TOTP_ENCRYPTION_KEY")
+    @classmethod
+    def validate_totp_encryption_key(cls, value: SecretStr) -> SecretStr:
+        encoded_key = value.get_secret_value().strip()
+        if not encoded_key:
+            raise ValueError("TOTP_ENCRYPTION_KEY must not be empty.")
+
+        try:
+            padded_key = encoded_key + "=" * (-len(encoded_key) % 4)
+            key = base64.b64decode(
+                padded_key.encode("ascii"), altchars=b"-_", validate=True
+            )
+        except (UnicodeEncodeError, binascii.Error, ValueError) as error:
+            raise ValueError(
+                "TOTP_ENCRYPTION_KEY must be URL-safe base64 encoded."
+            ) from error
+
+        if len(key) != TOTP_ENCRYPTION_KEY_BYTES:
+            raise ValueError("TOTP_ENCRYPTION_KEY must decode to 32 bytes.")
+        return SecretStr(encoded_key)
 
 
 settings = Settings()
