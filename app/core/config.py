@@ -2,7 +2,9 @@ import base64
 import binascii
 from typing import List, Literal, Union
 import json
-from pydantic import SecretStr, field_validator
+from urllib.parse import urlsplit
+
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +19,32 @@ INSECURE_JWT_SECRET_VALUES = frozenset(
         "replace_with_a_secret_generated_outside_this_repository",
     }
 )
+
+
+def _canonical_configured_origin(value: str) -> str:
+    parsed = urlsplit(value.strip())
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("CORS_ORIGINS entries must be absolute origins without paths.")
+
+    host = parsed.hostname.rstrip(".").lower()
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("CORS_ORIGINS contains an invalid port.") from error
+
+    if ":" in host:
+        host = f"[{host}]"
+    if port and (parsed.scheme, port) not in {("http", 80), ("https", 443)}:
+        host = f"{host}:{port}"
+    return f"{parsed.scheme}://{host}"
 
 
 class Settings(BaseSettings):
@@ -87,7 +115,18 @@ class Settings(BaseSettings):
             origins = v
         if not origins or "*" in origins:
             raise ValueError("CORS_ORIGINS must list explicit origins when credentials are enabled.")
-        return origins
+        return [_canonical_configured_origin(origin) for origin in origins]
+
+    @model_validator(mode="after")
+    def validate_production_web_security(self):
+        if self.APP_ENV.lower() in {"production", "prod"}:
+            if not self.SESSION_COOKIE_SECURE:
+                raise ValueError("SESSION_COOKIE_SECURE must be enabled in production.")
+            if any(not origin.startswith("https://") for origin in self.CORS_ORIGINS):
+                raise ValueError("CORS_ORIGINS must use HTTPS in production.")
+            if not _canonical_configured_origin(self.FRONTEND_URL).startswith("https://"):
+                raise ValueError("FRONTEND_URL must use HTTPS in production.")
+        return self
 
     @field_validator("JWT_SECRET_KEY")
     @classmethod

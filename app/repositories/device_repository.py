@@ -3,7 +3,8 @@ from typing import List, Optional
 import uuid
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
-from app.models.auth import Dispositivo, Sesion, SesionBoveda
+from app.models.auth import DesafioDispositivo, Dispositivo, Sesion, SesionBoveda, Usuario
+from app.repositories.auth_repository import AuthRepository
 from app.schemas.device import DeviceRegisterRequest
 
 
@@ -81,39 +82,71 @@ class DeviceRepository:
         device: Dispositivo,
         revocado_por: uuid.UUID,
     ) -> None:
-        """Revoca las sesiones activas vinculadas a este dispositivo y lo marca como revocado/eliminado."""
-        now = datetime.now(timezone.utc)
-        # Revocar sesiones asociadas
-        stmt_sessions = (
-            update(Sesion)
-            .where(Sesion.id_dispositivo == device.id_dispositivo, Sesion.revocada == False)
-            .values(
-                revocada=True,
-                motivo_revocacion="DISPOSITIVO_DESVINCULADO",
-                ultima_actividad=now,
-            )
+        """Preserva la identidad revocada como tombstone e invalida sus capacidades."""
+        self._revoke_devices(
+            [device.id_dispositivo],
+            revocado_por,
+            motivo="DISPOSITIVO_DESVINCULADO",
         )
-        self.db.execute(stmt_sessions)
+        self.db.refresh(device)
+
+    def _revoke_devices(
+        self,
+        device_ids: List[uuid.UUID],
+        revocado_por: uuid.UUID,
+        motivo: str,
+        *,
+        commit: bool = True,
+    ) -> int:
+        """Make revocation terminal before invalidating dependent capabilities."""
+        if not device_ids:
+            return 0
+        now = datetime.now(timezone.utc)
+        # This conditional update obtains the device row lock in PostgreSQL. Any stale
+        # proof or approval must re-evaluate its state after this transaction commits.
+        revoked = self.db.execute(
+            update(Dispositivo)
+            .where(
+                Dispositivo.id_dispositivo.in_(device_ids),
+                Dispositivo.estado != "REVOKED",
+            )
+            .values(
+                estado="REVOKED",
+                es_confiable=False,
+                fecha_revocacion=now,
+                revocado_por=revocado_por,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        session_ids = select(Sesion.id_sesion).where(Sesion.id_dispositivo.in_(device_ids))
+        self.db.execute(
+            update(DesafioDispositivo)
+            .where(
+                DesafioDispositivo.id_dispositivo.in_(device_ids),
+                DesafioDispositivo.consumido_en.is_(None),
+            )
+            .values(consumido_en=now, intentos=DesafioDispositivo.intentos + 1)
+        )
         self.db.execute(
             update(SesionBoveda)
             .where(
-                SesionBoveda.id_sesion.in_(
-                    select(Sesion.id_sesion).where(
-                        Sesion.id_dispositivo == device.id_dispositivo
-                    )
-                ),
+                SesionBoveda.id_sesion.in_(session_ids),
                 SesionBoveda.revocada.is_(False),
             )
             .values(revocada=True, motivo_revocacion="DISPOSITIVO_REVOCADO")
         )
-
-        # Actualizar estado del dispositivo
-        device.estado = "REVOKED"
-        device.es_confiable = False
-        device.fecha_revocacion = now
-        device.revocado_por = revocado_por
-        self.db.add(device)
-        self.db.commit()
+        self.db.execute(
+            update(Sesion)
+            .where(Sesion.id_dispositivo.in_(device_ids), Sesion.revocada.is_(False))
+            .values(
+                revocada=True,
+                motivo_revocacion=motivo,
+                ultima_actividad=now,
+            )
+        )
+        if commit:
+            self.db.commit()
+        return revoked.rowcount or 0
 
     # --- CU-05: Métodos de Gestión y Revocación Administrativa ---
 
@@ -121,6 +154,53 @@ class DeviceRepository:
         """Obtiene un dispositivo por su ID sin filtrar por usuario (para uso administrativo)."""
         stmt = select(Dispositivo).where(Dispositivo.id_dispositivo == device_id)
         return self.db.scalars(stmt).first()
+
+    def approve_pending_device(
+        self,
+        device_id: uuid.UUID,
+        approver_id: uuid.UUID,
+    ) -> Dispositivo:
+        """Promotes only a possession-verified pending identity under a row lock."""
+        device = self.db.scalars(
+            select(Dispositivo)
+            .where(Dispositivo.id_dispositivo == device_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if not device:
+            raise ValueError("DEVICE_NOT_FOUND")
+        if device.id_usuario == approver_id:
+            raise PermissionError("SELF_APPROVAL_FORBIDDEN")
+        if device.estado == "REVOKED":
+            raise ValueError("DEVICE_REVOKED")
+        if not device.public_key or not device.identidad_verificada_en:
+            raise ValueError("POSSESSION_PROOF_REQUIRED")
+        if device.estado != "PENDING":
+            raise ValueError("DEVICE_NOT_PENDING")
+
+        now = datetime.now(timezone.utc)
+        approved = self.db.execute(
+            update(Dispositivo)
+            .where(
+                Dispositivo.id_dispositivo == device_id,
+                Dispositivo.estado == "PENDING",
+                Dispositivo.identidad_verificada_en.is_not(None),
+            )
+            .values(
+                estado="TRUSTED",
+                es_confiable=True,
+                confianza_otorgada_en=now,
+                confianza_otorgada_por=approver_id,
+                ultimo_acceso=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if approved.rowcount != 1:
+            self.db.rollback()
+            raise ValueError("DEVICE_APPROVAL_RACE")
+        self.db.flush()
+        self.db.refresh(device)
+        return device
 
     def get_all_devices_admin(
         self,
@@ -197,39 +277,12 @@ class DeviceRepository:
         motivo: str = "Revocación administrativa de seguridad",
     ) -> None:
         """CU-05: Invalida el dispositivo y revoca inmediatamente todas las sesiones activas vinculadas."""
-        now = datetime.now(timezone.utc)
-
-        # Invalida todas las sesiones activas en la tabla sesion
-        stmt_sessions = (
-            update(Sesion)
-            .where(Sesion.id_dispositivo == device.id_dispositivo, Sesion.revocada == False)
-            .values(
-                revocada=True,
-                motivo_revocacion=f"REVOCADO_POR_ADMINISTRADOR: {motivo}",
-                ultima_actividad=now,
-            )
+        self._revoke_devices(
+            [device.id_dispositivo],
+            admin_id,
+            motivo=f"REVOCADO_POR_ADMINISTRADOR: {motivo}",
         )
-        self.db.execute(stmt_sessions)
-        self.db.execute(
-            update(SesionBoveda)
-            .where(
-                SesionBoveda.id_sesion.in_(
-                    select(Sesion.id_sesion).where(
-                        Sesion.id_dispositivo == device.id_dispositivo
-                    )
-                ),
-                SesionBoveda.revocada.is_(False),
-            )
-            .values(revocada=True, motivo_revocacion="DISPOSITIVO_REVOCADO_ADMIN")
-        )
-
-        # Invalida el dispositivo
-        device.estado = "REVOKED"
-        device.es_confiable = False
-        device.fecha_revocacion = now
-        device.revocado_por = admin_id
-        self.db.add(device)
-        self.db.commit()
+        self.db.refresh(device)
 
     def revoke_all_devices_for_user(
         self,
@@ -238,41 +291,31 @@ class DeviceRepository:
         motivo: str = "Revocación masiva de terminales por seguridad",
     ) -> int:
         """CU-05: Revoca todos los dispositivos y todas las sesiones de una cuenta."""
-        now = datetime.now(timezone.utc)
-
-        # 1. Revocar todas las sesiones del usuario
-        stmt_sessions = (
-            update(Sesion)
-            .where(Sesion.id_usuario == user_id, Sesion.revocada == False)
-            .values(
-                revocada=True,
-                motivo_revocacion=f"REVOCACION_MASIVA_ADMIN: {motivo}",
-                ultima_actividad=now,
-            )
+        target_user = self.db.scalars(
+            select(Usuario)
+            .where(Usuario.id_usuario == user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if not target_user:
+            return 0
+        device_ids = list(
+            self.db.scalars(
+                select(Dispositivo.id_dispositivo)
+                .where(Dispositivo.id_usuario == user_id)
+                .with_for_update()
+            ).all()
         )
-        self.db.execute(stmt_sessions)
-        self.db.execute(
-            update(SesionBoveda)
-            .where(
-                SesionBoveda.id_sesion.in_(
-                    select(Sesion.id_sesion).where(Sesion.id_usuario == user_id)
-                ),
-                SesionBoveda.revocada.is_(False),
-            )
-            .values(revocada=True, motivo_revocacion="DISPOSITIVO_REVOCADO_ADMIN")
+        revoked = self._revoke_devices(
+            device_ids,
+            admin_id,
+            motivo=f"REVOCACION_MASIVA_ADMIN: {motivo}",
+            commit=False,
         )
-
-        # 2. Revocar todos los dispositivos del usuario
-        stmt_devices = (
-            update(Dispositivo)
-            .where(Dispositivo.id_usuario == user_id, Dispositivo.estado != "REVOKED")
-            .values(
-                estado="REVOKED",
-                es_confiable=False,
-                fecha_revocacion=now,
-                revocado_por=admin_id,
-            )
+        AuthRepository(self.db).revoke_user_security_state(
+            user_id,
+            "REVOCACION_MASIVA_ADMIN",
+            commit=False,
         )
-        result = self.db.execute(stmt_devices)
         self.db.commit()
-        return result.rowcount or 0
+        return revoked

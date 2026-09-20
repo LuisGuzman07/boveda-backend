@@ -62,6 +62,10 @@ CSRF separado. `SESSION_COOKIE_SECURE=true` debe mantenerse en cualquier entorno
 desplegado. Para desarrollo estrictamente local sobre HTTP se puede usar
 `SESSION_COOKIE_SECURE=false` solo en el `.env` no versionado. `CORS_ORIGINS` debe
 contener orígenes explícitos; no se admite `*` cuando se usan credenciales.
+Cada origen debe ser una URL canónica sin ruta. En producción, `CORS_ORIGINS` y
+`FRONTEND_URL` deben usar HTTPS; la aplicación rechaza una configuración HTTP.
+Las rutas web que crean, rotan o eliminan cookies exigen además un encabezado
+`Origin` exacto de esa allowlist. CORS por sí solo no autoriza una sesión.
 La SPA y la API deben compartir host de cookie (por ejemplo, mediante un proxy
 same-origin); CORS no permite que JavaScript lea cookies de un host API distinto.
 
@@ -123,6 +127,37 @@ docker compose exec backend alembic upgrade head
 La migración de sesiones vinculadas a dispositivo del Lote 2B realiza un backfill y
 revoca sesiones legacy no vinculadas. Ejecuta primero una copia de seguridad y aplícala
 en línea contra PostgreSQL; no genera SQL offline válido por diseño.
+
+La recuperación de un entorno anterior al Lote 2B se valida exclusivamente contra una
+base PostgreSQL local y descartable. El script borra el esquema `public`, crea una
+instantánea previa a `d2b20260919`, migra a `head`, restaura la instantánea y confirma
+el revision y un registro sentinel. Rechaza hosts no locales, exige el nombre
+`boveda_lote2b_tmp*`, `boveda_lote2b_temp*` o `boveda_lote2b_test*`, y requiere una
+confirmación externa explícita. La URL no puede incluir parámetros de consulta: se
+rechazan antes de abrir una conexión para impedir que opciones como `host` o
+`dbname` redirijan la operación destructiva.
+
+```bash
+BOVEDA_L2B_DISPOSABLE_DATABASE=1 python scripts/verify_lote2b_backup_restore.py \
+  --temporary-database-url "$DATABASE_URL" \
+  --confirm-temporary-database
+```
+
+Si el equipo no tiene `pg_dump` y `pg_restore`, se puede usar únicamente el contenedor
+PostgreSQL temporal que aloja esa base con `--postgres-tools-container <nombre-contenedor>`.
+
+No ejecutes este procedimiento en una base compartida, de desarrollo persistente o de
+producción. La migración de aprobación explícita (`d2b20260920`) requiere reaprobar
+administrativamente cualquier identidad que hubiera quedado `TRUSTED` antes de ella.
+La migración de fencing (`d2b20260921`) invalida las sesiones y desafíos pendientes
+cuando cambia el estado de seguridad de una cuenta y se detiene si detecta una
+identidad de instalación o huella de clave duplicada entre cuentas; esas colisiones
+deben resolverse explícitamente antes de reintentarla.
+
+Las pruebas PostgreSQL siguen la misma restricción y requieren explícitamente
+`CU06_TEST_POSTGRES=1` y `BOVEDA_L2B_DISPOSABLE_DATABASE=1`; el fixture sólo acepta
+un host local y los mismos nombres temporales. Nunca reutilices la URL normal de la
+aplicación para esa suite.
 
 Para generar una nueva migración automática tras crear o modificar modelos:
 

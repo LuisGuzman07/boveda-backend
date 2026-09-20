@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
+import uuid
 
+import pyotp
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -10,9 +12,10 @@ from app.api.routes.recovery import get_recovery_service
 from app.core.database import Base, get_db
 from app.core.security import get_password_hash, hash_token, verify_password
 from app.main import app
-from app.models.auth import EventoAuditoria, Sesion, Usuario
-from app.models.mfa import RecuperacionCuenta
+from app.models.auth import DesafioDispositivo, Dispositivo, EventoAuditoria, Sesion, SesionBoveda, Usuario
+from app.models.mfa import AutenticadorMfa, RecuperacionCuenta
 from app.services.recovery_service import RecoveryRateLimiter, RecoveryService
+from app.services.totp_secret_service import store_encrypted_totp_secret
 
 
 class FakeRecoveryEmail:
@@ -194,6 +197,103 @@ def test_reset_consumes_token_revokes_sessions_and_changes_password(recovery_env
     assert token_record.utilizado is True
     assert updated_session.revocada is True
     assert reused.status_code == 400
+
+
+def test_recovery_invalidates_mfa_codes_vault_sessions_and_pending_challenges(recovery_environment):
+    _request_recovery(recovery_environment)
+    token = _captured_token(recovery_environment)
+    db = recovery_environment["db"]
+    user = recovery_environment["user"]
+    now = datetime.now(timezone.utc)
+    device = Dispositivo(
+        id_usuario=user.id_usuario,
+        identificador_seguro="recovery-device-identity",
+        estado="PENDING",
+        es_confiable=False,
+    )
+    db.add(device)
+    db.flush()
+    session = Sesion(
+        id_usuario=user.id_usuario,
+        id_dispositivo=device.id_dispositivo,
+        refresh_token_hash="recovery-session-hash",
+        fecha_expiracion=now + timedelta(days=1),
+    )
+    db.add(session)
+    db.flush()
+    challenge = DesafioDispositivo(
+        id_usuario=user.id_usuario,
+        id_dispositivo=device.id_dispositivo,
+        id_sesion=session.id_sesion,
+        proposito="DEVICE_ENROLLMENT",
+        nonce_hash="a" * 64,
+        context_hash="b" * 64,
+        fecha_expiracion=now + timedelta(minutes=2),
+    )
+    mfa = AutenticadorMfa(id_usuario=user.id_usuario, tipo="TOTP", estado="ACTIVO")
+    backup = RecuperacionCuenta(
+        id_usuario=user.id_usuario,
+        codigo="****-TEST",
+        token_hash="backup-hash",
+        tipo="BACKUP_CODE",
+        utilizado=False,
+    )
+    db.add_all([challenge, mfa, backup])
+    db.flush()
+    vault_session = SesionBoveda(
+        id_usuario=user.id_usuario,
+        id_dispositivo=device.id_dispositivo,
+        id_sesion=session.id_sesion,
+        id_desafio=challenge.id_desafio,
+        jti=uuid.uuid4().hex,
+        mfa_verificado_en=now,
+        fecha_expiracion=now + timedelta(minutes=5),
+    )
+    db.add(vault_session)
+    db.commit()
+
+    reset = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/reset-password",
+        json={"token": token, "password": "NuevaPassword123!*"},
+    )
+    assert reset.status_code == 200
+
+    db.expire_all()
+    assert db.get(Sesion, session.id_sesion).revocada is True
+    assert db.get(SesionBoveda, vault_session.id_sesion_boveda).revocada is True
+    assert db.get(DesafioDispositivo, challenge.id_desafio).consumido_en is not None
+    assert db.get(AutenticadorMfa, mfa.id_autenticador).estado == "REVOCADO"
+    assert db.get(RecuperacionCuenta, backup.id_recuperacion).utilizado is True
+
+
+def test_recovery_invalidates_an_already_issued_mfa_login_challenge(recovery_environment):
+    db = recovery_environment["db"]
+    user = recovery_environment["user"]
+    secret = pyotp.random_base32()
+    mfa = AutenticadorMfa(id_usuario=user.id_usuario, tipo="TOTP", estado="ACTIVO")
+    store_encrypted_totp_secret(mfa, secret)
+    db.add(mfa)
+    db.commit()
+
+    _request_recovery(recovery_environment)
+    pending = recovery_environment["client"].post(
+        "/api/v1/auth/login",
+        json={"correo": user.correo, "password": "PasswordBase123!*"},
+    )
+    assert pending.status_code == 200
+    assert pending.json()["mfa_required"] is True
+
+    reset = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/reset-password",
+        json={"token": _captured_token(recovery_environment), "password": "NuevaPassword123!*"},
+    )
+    assert reset.status_code == 200
+
+    stale = recovery_environment["client"].post(
+        "/api/v1/auth/mfa/verify-login",
+        json={"mfa_token": pending.json()["mfa_token"], "code": pyotp.TOTP(secret).now()},
+    )
+    assert stale.status_code == 401
 
 
 def test_new_request_invalidates_the_previous_token(recovery_environment):

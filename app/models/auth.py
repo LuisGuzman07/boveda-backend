@@ -87,6 +87,7 @@ class Usuario(Base):
     estado: Mapped[str] = mapped_column(String(50), default="ACTIVO")
     bloqueado_hasta: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     intentos_fallidos: Mapped[int] = mapped_column(Integer, default=0)
+    version_seguridad: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     ultimo_acceso: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     fecha_creacion: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -134,6 +135,9 @@ class Dispositivo(Base):
     estado: Mapped[str] = mapped_column(String(50), default="PENDING")
     identidad_verificada_en: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     confianza_otorgada_en: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    confianza_otorgada_por: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("usuario.id_usuario", ondelete="SET NULL"), nullable=True
+    )
     fecha_registro: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -148,6 +152,29 @@ class Dispositivo(Base):
     usuario: Mapped[Usuario] = relationship("Usuario", foreign_keys=[id_usuario], back_populates="dispositivos")
     sesiones: Mapped[List["Sesion"]] = relationship("Sesion", back_populates="dispositivo")
     desafios: Mapped[List["DesafioDispositivo"]] = relationship("DesafioDispositivo", back_populates="dispositivo")
+
+
+class IdentidadDispositivo(Base):
+    """Permanent global claim that prevents a revoked installation identity from returning."""
+
+    __tablename__ = "identidad_dispositivo"
+    __table_args__ = (
+        UniqueConstraint("tipo", "huella", name="uq_identidad_dispositivo_tipo_huella"),
+    )
+
+    id_identidad: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    id_dispositivo: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dispositivo.id_dispositivo", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    tipo: Mapped[str] = mapped_column(String(30), nullable=False)
+    huella: Mapped[str] = mapped_column(String(64), nullable=False)
+    fecha_registro: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class Sesion(Base):
@@ -173,6 +200,7 @@ class Sesion(Base):
     csrf_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     refresh_consumido_en: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     mfa_verificado_en: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    version_seguridad: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     revocada: Mapped[bool] = mapped_column(Boolean, default=False)
     motivo_revocacion: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     fecha_inicio: Mapped[datetime] = mapped_column(

@@ -46,6 +46,9 @@ class DeviceRead(BaseModel):
     huella_clave_publica: Optional[str] = None
     es_confiable: bool
     estado: str
+    identidad_verificada_en: Optional[datetime] = None
+    confianza_otorgada_en: Optional[datetime] = None
+    confianza_otorgada_por: Optional[uuid.UUID] = None
     fecha_registro: datetime
     ultimo_acceso: datetime
     es_dispositivo_actual: bool = False
@@ -91,6 +94,9 @@ class AdminDeviceRead(BaseModel):
     ultimo_acceso: datetime
     fecha_revocacion: Optional[datetime] = None
     revocado_por: Optional[uuid.UUID] = None
+    identidad_verificada_en: Optional[datetime] = None
+    confianza_otorgada_en: Optional[datetime] = None
+    confianza_otorgada_por: Optional[uuid.UUID] = None
     sesiones_activas: int = 0
 
 

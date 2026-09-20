@@ -1,5 +1,9 @@
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from app.core.database import SessionLocal
 from app.main import app
+from app.models.auth import EventoAuditoria, Permiso, Rol, Usuario
 
 client = TestClient(app)
 
@@ -82,3 +86,50 @@ def test_export_audit_csv():
     assert "ID Evento" in csv_text
     assert "Fecha y Hora" in csv_text
     assert "Acción" in csv_text
+
+
+def test_audit_read_permission_does_not_grant_export():
+    db = SessionLocal()
+    try:
+        user = db.scalars(select(Usuario).where(Usuario.correo == "investigador@boveda.com")).first()
+        permission = db.scalars(select(Permiso).where(Permiso.codigo == "audit:read")).first()
+        assert user is not None and permission is not None
+        read_only_role = Rol(nombre="Auditor solo lectura", permisos=[permission])
+        user.roles.append(read_only_role)
+        db.add(user)
+        db.commit()
+    finally:
+        db.close()
+
+    token = get_user_token("investigador@boveda.com")
+    readable = client.get(
+        "/api/v1/audit/events",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    forbidden_export = client.get(
+        "/api/v1/audit/export",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert readable.status_code == 200
+    assert forbidden_export.status_code == 403
+    assert "audit:export" in forbidden_export.json()["detail"]
+
+
+def test_audit_export_records_the_actor():
+    admin_token = get_user_token("admin@boveda.com")
+    response = client.get(
+        "/api/v1/audit/export",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 200
+
+    db = SessionLocal()
+    try:
+        event = db.scalars(
+            select(EventoAuditoria).where(EventoAuditoria.accion == "AUDITORIA_EXPORTADA")
+        ).first()
+        assert event is not None
+        assert event.resultado == "EXITO"
+        assert event.id_usuario is not None
+    finally:
+        db.close()

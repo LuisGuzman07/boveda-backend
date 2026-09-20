@@ -148,6 +148,12 @@ class AuthService:
             )
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas.")
 
+        # Recovery and MFA invalidation use this same row lock. Password verification
+        # must be fenced before a caller can capture the current security version.
+        user = self.repo.lock_user(user.id_usuario)
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas.")
+
         locked_until = _as_utc(user.bloqueado_hasta)
         if locked_until and locked_until > now:
             self.repo.create_audit_event(
@@ -176,6 +182,9 @@ class AuthService:
                 detail="La cuenta de usuario no se encuentra activa.",
             )
 
+        # Keep the version observed under the password-verification lock. The user
+        # update below commits, so recovery must invalidate this login if it wins later.
+        security_version = user.version_seguridad
         if not verify_password(request.password, user.password_hash):
             user.intentos_fallidos += 1
             if user.intentos_fallidos >= settings.MAX_FAILED_LOGIN_ATTEMPTS:
@@ -206,8 +215,18 @@ class AuthService:
         self.repo.update_user(user)
 
         device_info = request.dispositivo or DispositivoInfo()
-        device = self.repo.get_or_create_device(user.id_usuario, device_info)
-        active_mfa = self.mfa_repo.get_active_mfa(user.id_usuario)
+        device = self.repo.get_or_create_device(
+            user.id_usuario,
+            device_info,
+            expected_security_version=security_version,
+        )
+        locked_user = self.repo.lock_user(user.id_usuario)
+        if not locked_user or locked_user.version_seguridad != security_version:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="El estado de seguridad cambió. Inicia sesión nuevamente.",
+            )
+        active_mfa = self.mfa_repo.get_active_mfa(user.id_usuario, lock=True)
         if active_mfa:
             self.repo.create_audit_event(
                 accion="LOGIN_MFA_SOLICITADO",
@@ -226,13 +245,19 @@ class AuthService:
                         user.id_usuario,
                         device_id=device.id_dispositivo,
                         client_type=client_type,
+                        security_version=locked_user.version_seguridad,
                     ),
                     usuario=UsuarioRead.model_validate(user),
                 ),
                 None,
             )
 
-        issued = self.create_authenticated_session(user, device, client_type)
+        issued = self.create_authenticated_session(
+            locked_user,
+            device,
+            client_type,
+            expected_security_version=locked_user.version_seguridad,
+        )
         self.repo.create_audit_event(
             accion="LOGIN_EXITOSO",
             tipo_evento="AUTENTICACION",
@@ -251,6 +276,7 @@ class AuthService:
         device: Dispositivo,
         client_type: str,
         mfa_verified_at: Optional[datetime] = None,
+        expected_security_version: Optional[int] = None,
     ) -> IssuedSession:
         now = datetime.now(timezone.utc)
         session_id = uuid.uuid4()
@@ -275,6 +301,7 @@ class AuthService:
             client_type=client_type,
             csrf_hash=hash_token(csrf_token) if csrf_token else None,
             mfa_verified_at=mfa_verified_at,
+            expected_security_version=expected_security_version,
         )
         roles, permissions = _roles_and_permissions(user)
         access_token = create_access_token(
@@ -330,6 +357,7 @@ class AuthService:
             or session.tipo_cliente != client_type
             or not user
             or user.estado != "ACTIVO"
+            or session.version_seguridad != user.version_seguridad
             or not device
             or device.id_usuario != user.id_usuario
             or device.estado == "REVOKED"
@@ -517,6 +545,7 @@ def get_current_auth_context(
         or session.id_dispositivo != device_id
         or not user
         or user.estado != "ACTIVO"
+        or session.version_seguridad != user.version_seguridad
         or not device
         or device.id_usuario != user_id
         or device.estado == "REVOKED"

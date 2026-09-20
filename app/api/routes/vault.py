@@ -1,10 +1,14 @@
 import uuid
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Header, Request, Response, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.schemas.vault import VaultCreateRequest, VaultSessionRequest
 from app.services.auth_service import AuthenticatedSession, get_current_auth_context
-from app.services.vault_security import get_vault_context, issue_vault_session
+from app.services.vault_security import (
+    get_vault_context,
+    issue_vault_session,
+    revoke_current_vault_session,
+)
 from app.services.vault_service import VaultService
 
 router = APIRouter(prefix="/vaults", tags=["CU-06: Bóvedas cifradas"])
@@ -18,6 +22,24 @@ def create_vault_session(
     db: Session = Depends(get_db),
 ):
     return issue_vault_session(db, context, body, request)
+
+
+@router.get("/session")
+async def validate_vault_session(
+    context=Depends(get_vault_context),
+):
+    """Revalidates a signed vault capability without exposing vault contents."""
+    return {"status": "active"}
+
+
+@router.delete("/session", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_vault_session(
+    request: Request,
+    context=Depends(get_vault_context),
+    db: Session = Depends(get_db),
+):
+    revoke_current_vault_session(db, request, *context)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("", status_code=201)

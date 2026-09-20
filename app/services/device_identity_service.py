@@ -62,16 +62,19 @@ class DeviceIdentityService:
         client_ip: str | None = None,
         user_agent: str | None = None,
     ) -> tuple[DesafioDispositivo, str]:
-        if device.estado == DEVICE_REVOKED:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="DEVICE_REVOKED")
-        if not device.public_key:
+        locked_user, locked_device, locked_session = self.auth_repo.lock_authenticated_session(
+            user.id_usuario,
+            device.id_dispositivo,
+            session.id_sesion,
+        )
+        if not locked_device.public_key:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="El dispositivo no tiene una identidad criptografica registrada.",
             )
         if purpose == CHALLENGE_VAULT:
-            self._require_recent_mfa(session)
-            if device.estado != DEVICE_TRUSTED:
+            self.require_recent_mfa(locked_session)
+            if locked_device.estado != DEVICE_TRUSTED:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="El dispositivo debe estar TRUSTED para abrir una sesion de boveda.",
@@ -83,9 +86,9 @@ class DeviceIdentityService:
         )
         challenge = DesafioDispositivo(
             id_desafio=uuid.uuid4(),
-            id_usuario=user.id_usuario,
-            id_dispositivo=device.id_dispositivo,
-            id_sesion=session.id_sesion,
+            id_usuario=locked_user.id_usuario,
+            id_dispositivo=locked_device.id_dispositivo,
+            id_sesion=locked_session.id_sesion,
             proposito=purpose,
             nonce_hash=hashlib.sha256(nonce.encode("utf-8")).hexdigest(),
             context_hash="",
@@ -96,8 +99,8 @@ class DeviceIdentityService:
             challenge_transcript(
                 challenge.id_desafio,
                 purpose,
-                user.id_usuario,
-                device.id_dispositivo,
+                locked_user.id_usuario,
+                locked_device.id_dispositivo,
                 nonce,
                 expires_at,
             )
@@ -109,8 +112,8 @@ class DeviceIdentityService:
             accion="DESAFIO_DISPOSITIVO_EMITIDO",
             tipo_evento="DISPOSITIVO",
             resultado="EXITO",
-            user_id=user.id_usuario,
-            device_id=device.id_dispositivo,
+            user_id=locked_user.id_usuario,
+            device_id=locked_device.id_dispositivo,
             ip=client_ip,
             user_agent=user_agent,
             detalles={"proposito": purpose},
@@ -129,48 +132,60 @@ class DeviceIdentityService:
         client_ip: str | None = None,
         user_agent: str | None = None,
     ) -> DesafioDispositivo:
+        locked_user, locked_device, locked_session = self.auth_repo.lock_authenticated_session(
+            user.id_usuario,
+            device.id_dispositivo,
+            session.id_sesion,
+        )
+        if purpose == CHALLENGE_VAULT:
+            self.require_recent_mfa(locked_session)
+            if locked_device.estado != DEVICE_TRUSTED:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="El dispositivo debe estar TRUSTED para abrir una sesion de boveda.",
+                )
         challenge = self.db.get(DesafioDispositivo, challenge_id)
         now = datetime.now(timezone.utc)
         if (
             not challenge
-            or challenge.id_usuario != user.id_usuario
-            or challenge.id_dispositivo != device.id_dispositivo
-            or challenge.id_sesion != session.id_sesion
+            or challenge.id_usuario != locked_user.id_usuario
+            or challenge.id_dispositivo != locked_device.id_dispositivo
+            or challenge.id_sesion != locked_session.id_sesion
             or challenge.proposito != purpose
             or challenge.consumido_en is not None
             or self._as_utc(challenge.fecha_expiracion) <= now
         ):
-            self._audit_failure(user, device, purpose, client_ip, user_agent)
+            self._audit_failure(locked_user, locked_device, purpose, client_ip, user_agent)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Desafio de dispositivo invalido o expirado.")
 
         expected_nonce_hash = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
         transcript = challenge_transcript(
             challenge.id_desafio,
             challenge.proposito,
-            user.id_usuario,
-            device.id_dispositivo,
+            locked_user.id_usuario,
+            locked_device.id_dispositivo,
             nonce,
             self._as_utc(challenge.fecha_expiracion),
         )
         if (
             not secrets.compare_digest(expected_nonce_hash, challenge.nonce_hash)
             or not secrets.compare_digest(hashlib.sha256(transcript).hexdigest(), challenge.context_hash)
-            or not device.public_key
+            or not locked_device.public_key
         ):
             self._consume_failed_challenge(challenge, now)
-            self._audit_failure(user, device, purpose, client_ip, user_agent)
+            self._audit_failure(locked_user, locked_device, purpose, client_ip, user_agent)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Prueba de posesion invalida.")
 
         try:
-            public_key, fingerprint = normalize_ed25519_public_key(device.public_key)
-            if device.huella_clave_publica and not secrets.compare_digest(
-                fingerprint, device.huella_clave_publica
+            public_key, fingerprint = normalize_ed25519_public_key(locked_device.public_key)
+            if locked_device.huella_clave_publica and not secrets.compare_digest(
+                fingerprint, locked_device.huella_clave_publica
             ):
                 raise ValueError("Fingerprint mismatch")
             verify_ed25519_signature(public_key, signature, transcript)
         except (DeviceCryptoError, ValueError):
             self._consume_failed_challenge(challenge, now)
-            self._audit_failure(user, device, purpose, client_ip, user_agent)
+            self._audit_failure(locked_user, locked_device, purpose, client_ip, user_agent)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Prueba de posesion invalida.")
 
         consumed = self.db.execute(
@@ -183,16 +198,25 @@ class DeviceIdentityService:
         )
         if consumed.rowcount != 1:
             self.db.rollback()
-            self._audit_failure(user, device, purpose, client_ip, user_agent)
+            self._audit_failure(locked_user, locked_device, purpose, client_ip, user_agent)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Desafio de dispositivo ya utilizado.")
 
         if purpose == CHALLENGE_ENROLLMENT:
-            device.estado = DEVICE_TRUSTED
-            device.es_confiable = True
-            device.identidad_verificada_en = now
-            device.confianza_otorgada_en = now
-            device.ultimo_acceso = now
-            self.db.add(device)
+            verified = self.db.execute(
+                update(Dispositivo)
+                .where(
+                    Dispositivo.id_dispositivo == locked_device.id_dispositivo,
+                    Dispositivo.estado.in_([DEVICE_PENDING, DEVICE_TRUSTED]),
+                )
+                .values(
+                    identidad_verificada_en=now,
+                    ultimo_acceso=now,
+                )
+            )
+            if verified.rowcount != 1:
+                self.db.rollback()
+                self._audit_failure(locked_user, locked_device, purpose, client_ip, user_agent)
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="DEVICE_REVOKED")
         self.db.commit()
         self.db.refresh(challenge)
         self.auth_repo.create_audit_event(
@@ -203,8 +227,8 @@ class DeviceIdentityService:
             ),
             tipo_evento="DISPOSITIVO",
             resultado="EXITO",
-            user_id=user.id_usuario,
-            device_id=device.id_dispositivo,
+            user_id=locked_user.id_usuario,
+            device_id=locked_device.id_dispositivo,
             ip=client_ip,
             user_agent=user_agent,
             detalles={"proposito": purpose},
@@ -216,7 +240,7 @@ class DeviceIdentityService:
         return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
     @staticmethod
-    def _require_recent_mfa(session: Sesion) -> None:
+    def require_recent_mfa(session: Sesion) -> None:
         verified_at = session.mfa_verificado_en
         if verified_at is None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Se requiere MFA para esta operacion.")

@@ -1,11 +1,22 @@
 from datetime import datetime, timezone
+import hashlib
 from typing import List, Optional
 import uuid
 from fastapi import HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.core.device_crypto import DeviceCryptoError, normalize_ed25519_public_key
-from app.models.auth import Dispositivo, EventoAuditoria, Rol, Sesion, SesionBoveda, Usuario
+from app.models.auth import (
+    DesafioDispositivo,
+    Dispositivo,
+    EventoAuditoria,
+    IdentidadDispositivo,
+    Rol,
+    Sesion,
+    SesionBoveda,
+    Usuario,
+)
 from app.schemas.auth import DispositivoInfo
 
 
@@ -22,6 +33,82 @@ class AuthRepository:
         """Obtiene un usuario por su ID primario."""
         stmt = select(Usuario).where(Usuario.id_usuario == user_id)
         return self.db.scalars(stmt).first()
+
+    def lock_user(self, user_id: uuid.UUID) -> Optional[Usuario]:
+        """Serializes changes that can invalidate every session of one user."""
+        return self.db.scalars(
+            select(Usuario)
+            .where(Usuario.id_usuario == user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+
+    def get_active_session_for_update(
+        self,
+        session_id: uuid.UUID,
+        user_id: uuid.UUID,
+        security_version: int,
+    ) -> Sesion:
+        session = self.db.scalars(
+            select(Sesion)
+            .where(
+                Sesion.id_sesion == session_id,
+                Sesion.id_usuario == user_id,
+                Sesion.revocada.is_(False),
+                Sesion.version_seguridad == security_version,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Sesión expirada o revocada.",
+            )
+        return session
+
+    def lock_authenticated_session(
+        self,
+        user_id: uuid.UUID,
+        device_id: uuid.UUID,
+        session_id: uuid.UUID,
+    ) -> tuple[Usuario, Dispositivo, Sesion]:
+        """Re-checks an actor's server session at the mutation lock boundary."""
+        user = self.lock_user(user_id)
+        device = self.db.scalars(
+            select(Dispositivo)
+            .where(Dispositivo.id_dispositivo == device_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        session = self.db.scalars(
+            select(Sesion)
+            .where(Sesion.id_sesion == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        expires_at = session.fecha_expiracion if session else None
+        if expires_at and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if (
+            not user
+            or user.estado != "ACTIVO"
+            or not device
+            or device.id_usuario != user_id
+            or device.estado == "REVOKED"
+            or not session
+            or session.revocada
+            or not expires_at
+            or expires_at <= datetime.now(timezone.utc)
+            or session.id_usuario != user_id
+            or session.id_dispositivo != device_id
+            or session.version_seguridad != user.version_seguridad
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Sesión expirada o revocada.",
+            )
+        return user, device, session
 
     def get_role_by_name(self, name: str) -> Optional[Rol]:
         """Obtiene un rol por su nombre."""
@@ -59,28 +146,59 @@ class AuthRepository:
         return user
 
     def get_or_create_device(
-        self, user_id: uuid.UUID, info: DispositivoInfo
+        self,
+        user_id: uuid.UUID,
+        info: DispositivoInfo,
+        *,
+        expected_security_version: Optional[int] = None,
     ) -> Dispositivo:
-        """Registers a pending device identity without granting trust from client input."""
-        stmt = select(Dispositivo).where(
-            Dispositivo.id_usuario == user_id,
-            Dispositivo.identificador_seguro == info.identificador_seguro,
-        )
-        device = self.db.scalars(stmt).first()
+        """Registers a pending identity while retaining its global terminal claim."""
+        user = self.lock_user(user_id)
+        if not user or user.estado != "ACTIVO":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Usuario no válido o inactivo.",
+            )
+        if (
+            expected_security_version is not None
+            and user.version_seguridad != expected_security_version
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="El estado de seguridad cambió. Inicia sesión nuevamente.",
+            )
+
+        secure_id = info.identificador_seguro or str(uuid.uuid4())
+        public_key = None
+        fingerprint = None
+        vault_public_key = None
+        if info.public_key:
+            public_key, fingerprint = self._normalize_device_key(info.public_key)
+        if info.vault_public_key:
+            vault_public_key, _ = self._normalize_device_key(info.vault_public_key)
+
+        device = self.db.scalars(
+            select(Dispositivo)
+            .where(
+                Dispositivo.id_usuario == user_id,
+                Dispositivo.identificador_seguro == secure_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
 
         if device:
             if device.estado == "REVOKED":
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="El dispositivo fue revocado y no puede reactivarse.",
+                    detail="La identidad de instalación fue revocada y no puede registrarse de nuevo.",
                 )
             device.ultimo_acceso = datetime.now(timezone.utc)
             if info.nombre:
                 device.nombre = info.nombre
             if info.sistema_operativo:
                 device.sistema_operativo = info.sistema_operativo
-            if info.public_key:
-                public_key, fingerprint = self._normalize_device_key(info.public_key)
+            if public_key:
                 if device.public_key and device.public_key != public_key:
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
@@ -94,8 +212,8 @@ class AuthRepository:
                     device.es_confiable = False
                     device.identidad_verificada_en = None
                     device.confianza_otorgada_en = None
-            if info.vault_public_key:
-                vault_public_key, _ = self._normalize_device_key(info.vault_public_key)
+                    device.confianza_otorgada_por = None
+            if vault_public_key:
                 if (
                     device.clave_firma_boveda
                     and device.clave_firma_boveda != vault_public_key
@@ -106,19 +224,12 @@ class AuthRepository:
                     )
                 device.clave_firma_boveda = vault_public_key
         else:
-            public_key = None
-            fingerprint = None
-            vault_public_key = None
-            if info.public_key:
-                public_key, fingerprint = self._normalize_device_key(info.public_key)
-            if info.vault_public_key:
-                vault_public_key, _ = self._normalize_device_key(info.vault_public_key)
             device = Dispositivo(
                 id_usuario=user_id,
                 nombre=info.nombre,
                 tipo=info.tipo,
                 sistema_operativo=info.sistema_operativo,
-                identificador_seguro=info.identificador_seguro or str(uuid.uuid4()),
+                identificador_seguro=secure_id,
                 public_key=public_key,
                 clave_firma_boveda=vault_public_key,
                 algoritmo_clave="Ed25519" if public_key else None,
@@ -128,9 +239,54 @@ class AuthRepository:
             )
             self.db.add(device)
 
-        self.db.commit()
+        try:
+            self.db.flush()
+            self._claim_device_identities(device, secure_id, fingerprint)
+            self.db.commit()
+        except IntegrityError as error:
+            self.db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="La identidad de instalación ya fue registrada y no puede reutilizarse.",
+            ) from error
         self.db.refresh(device)
         return device
+
+    def _claim_device_identities(
+        self,
+        device: Dispositivo,
+        secure_id: str,
+        public_key_fingerprint: Optional[str],
+    ) -> None:
+        claims = [
+            ("INSTALLATION_ID", hashlib.sha256(secure_id.encode("utf-8")).hexdigest())
+        ]
+        if public_key_fingerprint:
+            claims.append(("DEVICE_KEY", public_key_fingerprint))
+        conditions = [
+            and_(IdentidadDispositivo.tipo == kind, IdentidadDispositivo.huella == fingerprint)
+            for kind, fingerprint in claims
+        ]
+        existing = self.db.scalars(
+            select(IdentidadDispositivo).where(or_(*conditions)).with_for_update()
+        ).all()
+        existing_by_identity = {(claim.tipo, claim.huella): claim for claim in existing}
+        for kind, fingerprint in claims:
+            claim = existing_by_identity.get((kind, fingerprint))
+            if claim and claim.id_dispositivo != device.id_dispositivo:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="La identidad de instalación fue revocada o ya pertenece a otro dispositivo.",
+                )
+            if not claim:
+                self.db.add(
+                    IdentidadDispositivo(
+                        id_identidad=uuid.uuid4(),
+                        id_dispositivo=device.id_dispositivo,
+                        tipo=kind,
+                        huella=fingerprint,
+                    )
+                )
 
     @staticmethod
     def _normalize_device_key(value: str) -> tuple[str, str]:
@@ -154,8 +310,39 @@ class AuthRepository:
         client_type: str = "NATIVE",
         csrf_hash: Optional[str] = None,
         mfa_verified_at: Optional[datetime] = None,
+        expected_security_version: Optional[int] = None,
     ) -> Sesion:
         """Registra una nueva sesión en la base de datos."""
+        user = self.lock_user(user_id)
+        if not user or user.estado != "ACTIVO":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Usuario no válido o inactivo.",
+            )
+        if (
+            expected_security_version is not None
+            and user.version_seguridad != expected_security_version
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="El estado de seguridad cambió. Inicia sesión nuevamente.",
+            )
+        if device_id:
+            active_device = self.db.scalars(
+                select(Dispositivo)
+                .where(
+                    Dispositivo.id_dispositivo == device_id,
+                    Dispositivo.id_usuario == user_id,
+                    Dispositivo.estado != "REVOKED",
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).first()
+            if not active_device:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="El dispositivo asociado fue revocado.",
+                )
         session = Sesion(
             id_sesion=session_id or uuid.uuid4(),
             id_usuario=user_id,
@@ -166,6 +353,7 @@ class AuthRepository:
             tipo_cliente=client_type,
             csrf_hash=csrf_hash,
             mfa_verificado_en=mfa_verified_at,
+            version_seguridad=user.version_seguridad,
             revocada=False,
             fecha_expiracion=expires_at,
         )
@@ -205,6 +393,15 @@ class AuthRepository:
                 Sesion.revocada.is_(False),
                 Sesion.refresh_jti == expected_jti,
                 Sesion.refresh_token_hash == expected_hash,
+                Sesion.version_seguridad
+                == select(Usuario.version_seguridad)
+                .where(Usuario.id_usuario == Sesion.id_usuario)
+                .scalar_subquery(),
+                Sesion.id_dispositivo.in_(
+                    select(Dispositivo.id_dispositivo).where(
+                        Dispositivo.estado != "REVOKED"
+                    )
+                ),
             )
             .values(
                 refresh_jti=new_jti,
@@ -248,6 +445,67 @@ class AuthRepository:
         self.db.refresh(session)
         return session
 
+    def revoke_user_security_state(
+        self,
+        user_id: uuid.UUID,
+        motivo: str,
+        *,
+        commit: bool = True,
+    ) -> int:
+        """Invalidate every server-side capability that depends on a user session."""
+        user = self.lock_user(user_id)
+        if not user:
+            return 0
+        now = datetime.now(timezone.utc)
+        user.version_seguridad += 1
+        session_ids = select(Sesion.id_sesion).where(Sesion.id_usuario == user_id)
+        self.db.execute(
+            update(SesionBoveda)
+            .where(SesionBoveda.id_usuario == user_id, SesionBoveda.revocada.is_(False))
+            .values(revocada=True, motivo_revocacion=motivo)
+        )
+        result = self.db.execute(
+            update(Sesion)
+            .where(Sesion.id_usuario == user_id, Sesion.revocada.is_(False))
+            .values(revocada=True, motivo_revocacion=motivo, ultima_actividad=now)
+        )
+        self.db.execute(
+            update(DesafioDispositivo)
+            .where(
+                DesafioDispositivo.id_usuario == user_id,
+                DesafioDispositivo.consumido_en.is_(None),
+                DesafioDispositivo.id_sesion.in_(session_ids),
+            )
+            .values(consumido_en=now, intentos=DesafioDispositivo.intentos + 1)
+        )
+        if commit:
+            self.db.commit()
+        return result.rowcount or 0
+
+    def add_audit_event(
+        self,
+        accion: str,
+        tipo_evento: str,
+        resultado: str,
+        user_id: Optional[uuid.UUID] = None,
+        device_id: Optional[uuid.UUID] = None,
+        ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        detalles: Optional[dict] = None,
+    ) -> EventoAuditoria:
+        event = EventoAuditoria(
+            id_usuario=user_id,
+            id_dispositivo=device_id,
+            accion=accion,
+            tipo_evento=tipo_evento,
+            resultado=resultado,
+            direccion_ip=ip,
+            user_agent=user_agent,
+            detalles=detalles,
+        )
+        self.db.add(event)
+        return event
+
     def create_audit_event(
         self,
         accion: str,
@@ -260,17 +518,16 @@ class AuthRepository:
         detalles: Optional[dict] = None,
     ) -> EventoAuditoria:
         """Crea un registro inmutable en la tabla EVENTO_AUDITORIA."""
-        event = EventoAuditoria(
-            id_usuario=user_id,
-            id_dispositivo=device_id,
+        event = self.add_audit_event(
             accion=accion,
             tipo_evento=tipo_evento,
             resultado=resultado,
-            direccion_ip=ip,
+            user_id=user_id,
+            device_id=device_id,
+            ip=ip,
             user_agent=user_agent,
             detalles=detalles,
         )
-        self.db.add(event)
         self.db.commit()
         self.db.refresh(event)
         return event

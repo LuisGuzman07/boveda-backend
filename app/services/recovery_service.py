@@ -195,7 +195,9 @@ class RecoveryService:
                 detail="El enlace de recuperacion es invalido, ya fue utilizado o ha expirado.",
             )
 
-        user = self.repo.find_user_by_id(token_record.id_usuario)
+        # Share the user lock with session issuance and MFA changes so recovery wins
+        # over an in-flight authentication that started before the password reset.
+        user = self.repo.find_user_by_id_for_update(token_record.id_usuario)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -228,6 +230,7 @@ class RecoveryService:
         revoked_sessions = self.repo.revoke_all_user_sessions(
             user.id_usuario, motivo="RESTABLECIMIENTO_CONTRASENA"
         )
+        self.repo.revoke_mfa_and_backup_codes(user.id_usuario)
 
         zero_knowledge_message = (
             "La contrasena de tu cuenta ha sido restablecida exitosamente. "

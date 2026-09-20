@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.request_security import get_client_ip
-from app.models.auth import Usuario
 from app.schemas.auth import LoginResponse
 from app.schemas.mfa import (
     MfaDisableRequest,
@@ -11,7 +10,7 @@ from app.schemas.mfa import (
     MfaStatusResponse,
     MfaVerifyLoginRequest,
 )
-from app.services.auth_service import get_current_user
+from app.services.auth_service import AuthenticatedSession, get_current_auth_context
 from app.services.mfa_service import MfaService
 
 router = APIRouter(prefix="/auth/mfa", tags=["MFA (Doble Factor)"])
@@ -25,13 +24,18 @@ router = APIRouter(prefix="/auth/mfa", tags=["MFA (Doble Factor)"])
 )
 def setup_mfa(
     request: Request,
-    current_user: Usuario = Depends(get_current_user),
+    context: AuthenticatedSession = Depends(get_current_auth_context),
     db: Session = Depends(get_db),
 ):
     service = MfaService(db)
     client_ip = get_client_ip(request)
     user_agent = request.headers.get("User-Agent", "Desconocido")
-    return service.setup_mfa(current_user, client_ip=client_ip, user_agent=user_agent)
+    return service.setup_mfa(
+        context.user,
+        context.session,
+        client_ip=client_ip,
+        user_agent=user_agent,
+    )
 
 
 @router.post(
@@ -42,13 +46,19 @@ def setup_mfa(
 def enable_mfa(
     request: Request,
     body: MfaEnableRequest,
-    current_user: Usuario = Depends(get_current_user),
+    context: AuthenticatedSession = Depends(get_current_auth_context),
     db: Session = Depends(get_db),
 ):
     service = MfaService(db)
     client_ip = get_client_ip(request)
     user_agent = request.headers.get("User-Agent", "Desconocido")
-    return service.enable_mfa(current_user, body, client_ip=client_ip, user_agent=user_agent)
+    return service.enable_mfa(
+        context.user,
+        body,
+        context.session,
+        client_ip=client_ip,
+        user_agent=user_agent,
+    )
 
 
 @router.post(
@@ -75,13 +85,19 @@ def verify_login_mfa(
 def disable_mfa(
     request: Request,
     body: MfaDisableRequest,
-    current_user: Usuario = Depends(get_current_user),
+    context: AuthenticatedSession = Depends(get_current_auth_context),
     db: Session = Depends(get_db),
 ):
     service = MfaService(db)
     client_ip = get_client_ip(request)
     user_agent = request.headers.get("User-Agent", "Desconocido")
-    return service.disable_mfa(current_user, body, client_ip=client_ip, user_agent=user_agent)
+    return service.disable_mfa(
+        context.user,
+        body,
+        context.session,
+        client_ip=client_ip,
+        user_agent=user_agent,
+    )
 
 
 @router.get(
@@ -90,8 +106,8 @@ def disable_mfa(
     summary="CU-02: Consultar estado de activación de MFA",
 )
 def get_mfa_status(
-    current_user: Usuario = Depends(get_current_user),
+    context: AuthenticatedSession = Depends(get_current_auth_context),
     db: Session = Depends(get_db),
 ):
     service = MfaService(db)
-    return service.get_status(current_user)
+    return service.get_status(context.user)

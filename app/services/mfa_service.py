@@ -14,13 +14,14 @@ from app.core.security import (
     decode_token,
     verify_password,
 )
-from app.models.auth import Dispositivo, Usuario
+from app.models.auth import Dispositivo, Sesion, Usuario
 from app.models.mfa import AutenticadorMfa
 from app.repositories.auth_repository import AuthRepository
 from app.repositories.mfa_repository import MfaRepository
 from app.services.totp_secret_service import get_totp_secret, store_encrypted_totp_secret
 from app.services.recovery_service import RecoveryRateLimiter
 from app.services.auth_service import AuthService, IssuedSession
+from app.services.device_identity_service import DeviceIdentityService
 from app.schemas.auth import DispositivoInfo, LoginResponse, UsuarioRead
 from app.schemas.mfa import (
     MfaDisableRequest,
@@ -40,9 +41,31 @@ class MfaService:
         self.mfa_repo = MfaRepository(db)
         self.auth_repo = AuthRepository(db)
 
+    def _require_current_session(
+        self,
+        session: Optional[Sesion],
+        user: Usuario,
+        *,
+        require_recent_mfa: bool = False,
+    ) -> Sesion:
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Se requiere una sesión activa para modificar MFA.",
+            )
+        locked_session = self.auth_repo.get_active_session_for_update(
+            session.id_sesion,
+            user.id_usuario,
+            user.version_seguridad,
+        )
+        if require_recent_mfa:
+            DeviceIdentityService.require_recent_mfa(locked_session)
+        return locked_session
+
     def setup_mfa(
         self,
         user: Usuario,
+        session: Optional[Sesion] = None,
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> MfaSetupResponse:
@@ -77,35 +100,45 @@ class MfaService:
             for _ in range(8)
         ]
 
-        # 5. Guardar autenticador en estado PENDIENTE
-        existing_mfa = self.mfa_repo.get_pending_or_active_mfa(user.id_usuario)
-        if existing_mfa:
-            store_encrypted_totp_secret(existing_mfa, secret)
-            existing_mfa.estado = "PENDIENTE"
-            self.mfa_repo.save_mfa(existing_mfa)
+        locked_user = self.auth_repo.lock_user(user.id_usuario)
+        if not locked_user or locked_user.estado != "ACTIVO":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario no válido o inactivo.")
+        locked_session = self._require_current_session(session, locked_user)
+        active_mfa = self.mfa_repo.get_active_mfa(locked_user.id_usuario, lock=True)
+        if active_mfa:
+            DeviceIdentityService.require_recent_mfa(locked_session)
+
+        # Pending backup codes are deliberately not accepted until this TOTP is verified.
+        pending_mfa = self.mfa_repo.get_pending_mfa(locked_user.id_usuario, lock=True)
+        if pending_mfa:
+            store_encrypted_totp_secret(pending_mfa, secret)
+            self.mfa_repo.save_mfa(pending_mfa, commit=False)
         else:
-            new_mfa = AutenticadorMfa(
+            pending_mfa = AutenticadorMfa(
                 id_autenticador=uuid.uuid4(),
-                id_usuario=user.id_usuario,
+                id_usuario=locked_user.id_usuario,
                 tipo="TOTP",
                 estado="PENDIENTE",
             )
-            store_encrypted_totp_secret(new_mfa, secret)
-            self.mfa_repo.save_mfa(new_mfa)
-
-        # 6. Guardar códigos de respaldo
-        self.mfa_repo.save_recovery_codes(user.id_usuario, backup_codes)
-
-        # 7. Auditar inicio de configuración
-        self.auth_repo.create_audit_event(
+            store_encrypted_totp_secret(pending_mfa, secret)
+            self.mfa_repo.save_mfa(pending_mfa, commit=False)
+        self.mfa_repo.save_pending_recovery_codes(
+            locked_user.id_usuario, backup_codes, commit=False
+        )
+        self.auth_repo.add_audit_event(
             accion="MFA_SETUP_INICIADO",
             tipo_evento="SEGURIDAD_MFA",
             resultado="EXITO",
-            user_id=user.id_usuario,
+            user_id=locked_user.id_usuario,
             ip=client_ip,
             user_agent=user_agent,
             detalles={"tipo": "TOTP"},
         )
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
         return MfaSetupResponse(
             secret=secret,
@@ -118,11 +151,19 @@ class MfaService:
         self,
         user: Usuario,
         request: MfaEnableRequest,
+        session: Optional[Sesion] = None,
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> dict:
         """Verifica el código de la app móvil y activa el segundo factor."""
-        mfa = self.mfa_repo.get_pending_or_active_mfa(user.id_usuario)
+        locked_user = self.auth_repo.lock_user(user.id_usuario)
+        if not locked_user or locked_user.estado != "ACTIVO":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario no válido o inactivo.")
+        locked_session = self._require_current_session(session, locked_user)
+        active_mfa = self.mfa_repo.get_active_mfa(locked_user.id_usuario, lock=True)
+        if active_mfa:
+            DeviceIdentityService.require_recent_mfa(locked_session)
+        mfa = self.mfa_repo.get_pending_mfa(locked_user.id_usuario, lock=True)
         if not mfa:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -131,15 +172,16 @@ class MfaService:
 
         totp = pyotp.TOTP(get_totp_secret(mfa))
         if not totp.verify(request.code.strip(), valid_window=1):
-            self.auth_repo.create_audit_event(
+            self.auth_repo.add_audit_event(
                 accion="MFA_ACTIVACION_FALLIDA",
                 tipo_evento="SEGURIDAD_MFA",
                 resultado="FALLO",
-                user_id=user.id_usuario,
+                user_id=locked_user.id_usuario,
                 ip=client_ip,
                 user_agent=user_agent,
                 detalles={"motivo": "Código TOTP inválido"},
             )
+            self.db.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Código de autenticación incorrecto o expirado.",
@@ -147,18 +189,47 @@ class MfaService:
 
         mfa.estado = "ACTIVO"
         mfa.ultimo_uso = datetime.now(timezone.utc)
-        self.mfa_repo.save_mfa(mfa)
+        self.mfa_repo.save_mfa(mfa, commit=False)
+        activated_codes = self.mfa_repo.activate_pending_recovery_codes(
+            locked_user.id_usuario, commit=False
+        )
+        if not activated_codes:
+            self.db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="La configuración MFA pendiente no tiene códigos de respaldo válidos.",
+            )
+        replaced = self.mfa_repo.revoke_other_active_mfa(
+            locked_user.id_usuario,
+            mfa.id_autenticador,
+            commit=False,
+        )
+        revoked_sessions = 0
+        if replaced:
+            revoked_sessions = self.auth_repo.revoke_user_security_state(
+                locked_user.id_usuario,
+                "REEMPLAZO_MFA",
+                commit=False,
+            )
 
-        self.auth_repo.create_audit_event(
+        self.auth_repo.add_audit_event(
             accion="MFA_ACTIVADO",
             tipo_evento="SEGURIDAD_MFA",
             resultado="EXITO",
-            user_id=user.id_usuario,
+            user_id=locked_user.id_usuario,
             ip=client_ip,
             user_agent=user_agent,
-            detalles={"tipo": "TOTP"},
+            detalles={
+                "tipo": "TOTP",
+                "reemplazo": bool(replaced),
+                "sesiones_revocadas": revoked_sessions,
+            },
         )
-
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
         return {"status": "ok", "message": "Autenticación de dos factores activada exitosamente."}
 
     def verify_login_mfa(
@@ -201,6 +272,7 @@ class MfaService:
         try:
             user_id = uuid.UUID(payload["sub"])
             device_id = uuid.UUID(payload["did"])
+            security_version = int(payload["sv"])
         except (KeyError, TypeError, ValueError) as error:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -212,14 +284,20 @@ class MfaService:
                 detail="El desafío MFA no pertenece a este tipo de cliente.",
             )
 
-        user = self.auth_repo.get_user_by_id(user_id)
+        user = self.auth_repo.lock_user(user_id)
         if not user or user.estado != "ACTIVO":
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Usuario no válido o inactivo.",
             )
 
-        mfa = self.mfa_repo.get_active_mfa(user.id_usuario)
+        if user.version_seguridad != security_version:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="El desafío MFA quedó invalidado por un cambio de seguridad.",
+            )
+
+        mfa = self.mfa_repo.get_active_mfa(user.id_usuario, lock=True)
         if not mfa:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -253,11 +331,13 @@ class MfaService:
             if totp.verify(code_input, valid_window=1):
                 is_valid = True
                 mfa.ultimo_uso = datetime.now(timezone.utc)
-                self.mfa_repo.save_mfa(mfa)
+                self.mfa_repo.save_mfa(mfa, commit=False)
 
         # 2. Si falló TOTP, intentar como código de respaldo
         if not is_valid:
-            if self.mfa_repo.verify_and_consume_recovery_code(user.id_usuario, code_input):
+            if self.mfa_repo.verify_and_consume_recovery_code(
+                user.id_usuario, code_input, commit=False
+            ):
                 is_valid = True
                 method_used = "BACKUP_CODE"
 
@@ -293,6 +373,7 @@ class MfaService:
             device,
             expected_client_type,
             mfa_verified_at=now,
+            expected_security_version=security_version,
         )
 
         self.auth_repo.create_audit_event(
@@ -311,27 +392,44 @@ class MfaService:
         self,
         user: Usuario,
         request: MfaDisableRequest,
+        session: Optional[Sesion] = None,
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> dict:
         """Desactiva el 2FA tras confirmar la contraseña del usuario."""
-        if not verify_password(request.password, user.password_hash):
+        locked_user = self.auth_repo.lock_user(user.id_usuario)
+        if not locked_user or locked_user.estado != "ACTIVO":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario no válido o inactivo.")
+        self._require_current_session(session, locked_user)
+        if not verify_password(request.password, locked_user.password_hash):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Contraseña incorrecta.",
             )
 
-        self.mfa_repo.revoke_mfa(user.id_usuario)
-
-        self.auth_repo.create_audit_event(
+        self.mfa_repo.revoke_mfa(locked_user.id_usuario, commit=False)
+        revoked_sessions = self.auth_repo.revoke_user_security_state(
+            locked_user.id_usuario,
+            "MFA_DESACTIVADO",
+            commit=False,
+        )
+        self.auth_repo.add_audit_event(
             accion="MFA_DESACTIVADO",
             tipo_evento="SEGURIDAD_MFA",
             resultado="EXITO",
-            user_id=user.id_usuario,
+            user_id=locked_user.id_usuario,
             ip=client_ip,
             user_agent=user_agent,
-            detalles={"motivo": "Solicitud de usuario"},
+            detalles={
+                "motivo": "Solicitud de usuario",
+                "sesiones_revocadas": revoked_sessions,
+            },
         )
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
         return {"status": "ok", "message": "Autenticación de dos factores desactivada."}
 

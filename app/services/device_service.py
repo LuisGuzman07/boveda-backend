@@ -2,9 +2,11 @@ from typing import List, Optional
 import uuid
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
-from app.models.auth import Dispositivo, Usuario
+from app.models.auth import Dispositivo, Sesion, Usuario
 from app.repositories.auth_repository import AuthRepository
 from app.repositories.device_repository import DeviceRepository
+from app.services.auth_service import AuthenticatedSession
+from app.services.device_identity_service import DeviceIdentityService
 from app.schemas.device import (
     DeviceActionResponse,
     DeviceAuthorizeRequest,
@@ -19,6 +21,30 @@ class DeviceService:
         self.db = db
         self.device_repo = DeviceRepository(db)
         self.auth_repo = AuthRepository(db)
+
+    def _refresh_authorization(self, user: Usuario) -> tuple[set[str], set[str]]:
+        self.db.expire(user, ["roles"])
+        roles = list(user.roles)
+        for role in roles:
+            self.db.expire(role, ["permisos"])
+        return (
+            {role.nombre for role in roles},
+            {permission.codigo for role in roles for permission in role.permisos},
+        )
+
+    def _lock_admin_session(self, context: AuthenticatedSession) -> Usuario:
+        admin_user, _, _ = self.auth_repo.lock_authenticated_session(
+            context.user.id_usuario,
+            context.device.id_dispositivo,
+            context.session.id_sesion,
+        )
+        roles, _ = self._refresh_authorization(admin_user)
+        if "Administrador" not in roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Acceso restringido: se requieren privilegios de Administrador.",
+            )
+        return admin_user
 
     def list_devices(
         self,
@@ -44,6 +70,9 @@ class DeviceService:
                 huella_clave_publica=d.huella_clave_publica,
                 es_confiable=d.es_confiable,
                 estado=d.estado,
+                identidad_verificada_en=d.identidad_verificada_en,
+                confianza_otorgada_en=d.confianza_otorgada_en,
+                confianza_otorgada_por=d.confianza_otorgada_por,
                 fecha_registro=d.fecha_registro,
                 ultimo_acceso=d.ultimo_acceso,
                 es_dispositivo_actual=is_current,
@@ -60,6 +89,7 @@ class DeviceService:
         self,
         user: Usuario,
         current_device: Dispositivo,
+        session: Sesion,
         request: DeviceRegisterRequest,
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
@@ -82,6 +112,7 @@ class DeviceService:
                 public_key=request.public_key,
                 vault_public_key=request.vault_public_key,
             ),
+            expected_security_version=session.version_seguridad,
         )
         self.auth_repo.create_audit_event(
             accion="REGISTRO_IDENTIDAD_DISPOSITIVO",
@@ -104,7 +135,7 @@ class DeviceService:
 
         return DeviceActionResponse(
             status="ok",
-            message="Identidad de dispositivo registrada como PENDING. Completa la prueba de posesión para confiar en ella.",
+            message="Identidad registrada como PENDING. Completa la prueba de posesión y espera aprobación administrativa.",
             dispositivo=read_item,
         )
 
@@ -181,6 +212,9 @@ class DeviceService:
                 ultimo_acceso=d.ultimo_acceso,
                 fecha_revocacion=d.fecha_revocacion,
                 revocado_por=d.revocado_por,
+                identidad_verificada_en=d.identidad_verificada_en,
+                confianza_otorgada_en=d.confianza_otorgada_en,
+                confianza_otorgada_por=d.confianza_otorgada_por,
                 sesiones_activas=row["sesiones_activas"],
             )
             items.append(item)
@@ -190,15 +224,88 @@ class DeviceService:
             dispositivos=items,
         )
 
+    def approve_device_admin(
+        self,
+        device_id: uuid.UUID,
+        context: AuthenticatedSession,
+        client_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> DeviceActionResponse:
+        """Approves a separate user's possession-verified pending device."""
+        admin_user, _, admin_session = self.auth_repo.lock_authenticated_session(
+            context.user.id_usuario,
+            context.device.id_dispositivo,
+            context.session.id_sesion,
+        )
+        roles, permissions = self._refresh_authorization(admin_user)
+        if "Administrador" not in roles and "devices:approve" not in permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Se requiere el permiso devices:approve para aprobar un dispositivo.",
+            )
+        DeviceIdentityService.require_recent_mfa(admin_session)
+        try:
+            device = self.device_repo.approve_pending_device(device_id, admin_user.id_usuario)
+        except PermissionError as error:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Un usuario no puede aprobar su propio dispositivo.",
+            ) from error
+        except ValueError as error:
+            details = {
+                "DEVICE_NOT_FOUND": (status.HTTP_404_NOT_FOUND, "Dispositivo no encontrado en el sistema."),
+                "DEVICE_REVOKED": (status.HTTP_403_FORBIDDEN, "El dispositivo fue revocado."),
+                "POSSESSION_PROOF_REQUIRED": (
+                    status.HTTP_409_CONFLICT,
+                    "El dispositivo debe demostrar posesión antes de ser aprobado.",
+                ),
+                "DEVICE_NOT_PENDING": (
+                    status.HTTP_409_CONFLICT,
+                    "El dispositivo ya no está pendiente de aprobación.",
+                ),
+                "DEVICE_APPROVAL_RACE": (
+                    status.HTTP_409_CONFLICT,
+                    "La aprobación no pudo completarse por un cambio concurrente.",
+                ),
+            }
+            status_code, detail = details.get(
+                str(error),
+                (status.HTTP_409_CONFLICT, "No se pudo aprobar el dispositivo."),
+            )
+            raise HTTPException(status_code=status_code, detail=detail) from error
+
+        self.auth_repo.add_audit_event(
+            accion="APROBACION_DISPOSITIVO_ADMIN",
+            tipo_evento="SEGURIDAD",
+            resultado="EXITO",
+            user_id=device.id_usuario,
+            device_id=device.id_dispositivo,
+            ip=client_ip,
+            user_agent=user_agent,
+            detalles={"aprobado_por": str(admin_user.id_usuario)},
+        )
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        self.db.refresh(device)
+        return DeviceActionResponse(
+            status="ok",
+            message="Dispositivo aprobado como TRUSTED por administración.",
+            dispositivo=DeviceRead.model_validate(device),
+        )
+
     def revoke_device_admin(
         self,
         device_id: uuid.UUID,
-        admin_user: Usuario,
+        context: AuthenticatedSession,
         motivo: str,
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> DeviceActionResponse:
         """CU-05: Invalida el dispositivo de cualquier usuario y cierra todas sus sesiones activas."""
+        admin_user = self._lock_admin_session(context)
         device = self.device_repo.get_device_by_id_global(device_id)
         if not device:
             raise HTTPException(
@@ -239,12 +346,13 @@ class DeviceService:
     def revoke_all_user_devices_admin(
         self,
         target_user_id: uuid.UUID,
-        admin_user: Usuario,
+        context: AuthenticatedSession,
         motivo: str,
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> dict:
         """CU-05: Expulsa todos los dispositivos y sesiones activas de un usuario por seguridad."""
+        admin_user = self._lock_admin_session(context)
         target_user = self.auth_repo.get_user_by_id(target_user_id)
         if not target_user:
             raise HTTPException(

@@ -60,6 +60,7 @@ def seed_database() -> None:
             ("files:read", "Leer/Descargar Archivos", "Permite consultar y descargar archivos"),
             ("files:delete", "Eliminar Archivos", "Permite eliminar archivos"),
             ("files:share", "Compartir Archivos", "Permite compartir accesos a archivos"),
+            ("devices:approve", "Aprobar Dispositivos", "Permite aprobar identidades de dispositivo verificadas"),
             ("audit:read", "Consultar Auditoría", "Permite ver logs y eventos de auditoría"),
             ("audit:export", "Exportar Auditoría", "Permite exportar reportes de seguridad"),
         ]
@@ -94,7 +95,7 @@ def seed_database() -> None:
             (
                 "Auditor",
                 "Acceso de solo lectura a auditoría",
-                [permissions["audit:read"], permissions["audit:export"], permissions["users:read"]],
+                [permissions["audit:read"], permissions["users:read"]],
             ),
             ("Invitado", "Acceso temporal de lectura", [permissions["files:read"]]),
         ]
@@ -110,6 +111,8 @@ def seed_database() -> None:
                 )
                 db.add(role)
                 db.flush()
+            else:
+                role.permisos = role_permissions
             roles[name] = role
 
         for account in _demo_accounts_from_environment():

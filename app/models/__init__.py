@@ -8,6 +8,7 @@ from app.models.auth import (
     rol_permiso,
     UsuarioRol,
     Dispositivo,
+    IdentidadDispositivo,
     Sesion,
     EventoAuditoria,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "rol_permiso",
     "UsuarioRol",
     "Dispositivo",
+    "IdentidadDispositivo",
     "Sesion",
     "EventoAuditoria",
     "AutenticadorMfa",

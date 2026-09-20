@@ -110,6 +110,7 @@ def create_mfa_token(
     subject: Union[str, Any],
     device_id: Optional[uuid.UUID] = None,
     client_type: str = "NATIVE",
+    security_version: Optional[int] = None,
 ) -> str:
     """Genera un JWT temporal de 5 minutos para el flujo de segundo factor MFA."""
     now = datetime.now(timezone.utc)
@@ -123,6 +124,8 @@ def create_mfa_token(
     }
     if device_id is not None:
         to_encode["did"] = str(device_id)
+    if security_version is not None:
+        to_encode["sv"] = security_version
     encoded_jwt = jwt.encode(
         to_encode, get_jwt_secret(), algorithm=settings.JWT_ALGORITHM
     )

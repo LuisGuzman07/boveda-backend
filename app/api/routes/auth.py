@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.request_security import get_client_ip
+from app.core.request_security import get_client_ip, require_allowed_web_origin
 from app.schemas.auth import (
     LoginRequest,
     LoginResponse,
@@ -90,6 +90,7 @@ def login_web(
     login_data: LoginRequest,
     request: Request,
     response: Response,
+    _: None = Depends(require_allowed_web_origin),
     db: Session = Depends(get_db),
 ):
     result, issued = AuthService(db).login_web(
@@ -109,9 +110,11 @@ def refresh_token(refresh_data: RefreshTokenRequest, db: Session = Depends(get_d
 
 @router.post("/web/refresh", response_model=LoginResponse)
 def refresh_web(
+    request: Request,
     response: Response,
     refresh_token: Optional[str] = Cookie(None, alias=settings.SESSION_COOKIE_NAME),
     csrf_token: Optional[str] = Header(None, alias="X-CSRF-Token"),
+    _: None = Depends(require_allowed_web_origin),
     db: Session = Depends(get_db),
 ):
     if not refresh_token:
@@ -140,9 +143,11 @@ def logout(
 
 @router.post("/web/logout", response_model=LogoutResponse)
 def logout_web(
+    request: Request,
     response: Response,
     refresh_token: Optional[str] = Cookie(None, alias=settings.SESSION_COOKIE_NAME),
     csrf_token: Optional[str] = Header(None, alias="X-CSRF-Token"),
+    _: None = Depends(require_allowed_web_origin),
     db: Session = Depends(get_db),
 ):
     AuthService(db).logout_web(refresh_token, csrf_token)
@@ -155,6 +160,7 @@ def verify_login_mfa_web(
     body: MfaVerifyLoginRequest,
     request: Request,
     response: Response,
+    _: None = Depends(require_allowed_web_origin),
     db: Session = Depends(get_db),
 ):
     result, issued = MfaService(db).verify_login_mfa_web(

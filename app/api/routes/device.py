@@ -5,8 +5,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.request_security import get_client_ip
-from app.models.auth import Usuario
+from app.core.request_security import get_client_ip, require_allowed_web_origin
 from app.schemas.device import (
     DeviceActionResponse,
     DeviceAuthorizeRequest,
@@ -61,6 +60,7 @@ def register_device(
     return DeviceService(db).register_device(
         user=context.user,
         current_device=context.device,
+        session=context.session,
         request=device_data,
         client_ip=get_client_ip(request),
         user_agent=request.headers.get("User-Agent", "Desconocido"),
@@ -121,7 +121,7 @@ def prove_device_challenge(
     db.refresh(context.device)
     return DeviceActionResponse(
         message=(
-            "Identidad de dispositivo verificada y marcada como TRUSTED."
+            "Posesión de identidad verificada. El dispositivo continúa PENDING hasta aprobación administrativa."
             if stored_challenge.proposito == CHALLENGE_ENROLLMENT
             else "Prueba de posesión del dispositivo verificada."
         ),
@@ -170,13 +170,38 @@ def delete_device(
     )
 
 
-def verify_admin_role(current_user: Usuario = Depends(get_current_user)) -> Usuario:
-    if "Administrador" not in {role.nombre for role in current_user.roles}:
+def _require_web_origin_for_context(request: Request, context: AuthenticatedSession) -> None:
+    if context.session.tipo_cliente == "WEB":
+        require_allowed_web_origin(request)
+
+
+def verify_admin_role(
+    request: Request,
+    context: AuthenticatedSession = Depends(get_current_auth_context),
+) -> AuthenticatedSession:
+    _require_web_origin_for_context(request, context)
+    if "Administrador" not in {role.nombre for role in context.user.roles}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Acceso restringido: se requieren privilegios de Administrador.",
         )
-    return current_user
+    return context
+
+
+def verify_device_approval_authority(
+    request: Request,
+    context: AuthenticatedSession = Depends(get_current_auth_context),
+) -> AuthenticatedSession:
+    _require_web_origin_for_context(request, context)
+    roles = {role.nombre for role in context.user.roles}
+    permissions = {permission.codigo for role in context.user.roles for permission in role.permisos}
+    if "Administrador" not in roles and "devices:approve" not in permissions:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Se requiere el permiso devices:approve para aprobar un dispositivo.",
+        )
+    DeviceIdentityService.require_recent_mfa(context.session)
+    return context
 
 
 @router.get("/admin/all")
@@ -184,7 +209,7 @@ def list_all_devices_admin(
     query: Optional[str] = None,
     solo_confiables: Optional[bool] = None,
     estado: Optional[str] = None,
-    current_user: Usuario = Depends(verify_admin_role),
+    context: AuthenticatedSession = Depends(verify_admin_role),
     db: Session = Depends(get_db),
 ):
     return DeviceService(db).list_all_devices_admin(query, solo_confiables, estado)
@@ -195,13 +220,28 @@ def revoke_device_admin(
     device_id: uuid.UUID,
     request: Request,
     body: Optional[dict] = None,
-    current_user: Usuario = Depends(verify_admin_role),
+    context: AuthenticatedSession = Depends(verify_admin_role),
     db: Session = Depends(get_db),
 ):
     return DeviceService(db).revoke_device_admin(
         device_id=device_id,
-        admin_user=current_user,
+        context=context,
         motivo=(body or {}).get("motivo", "Revocación administrativa preventiva de seguridad"),
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
+    )
+
+
+@router.post("/admin/{device_id}/approve", response_model=DeviceActionResponse)
+def approve_device_admin(
+    device_id: uuid.UUID,
+    request: Request,
+    context: AuthenticatedSession = Depends(verify_device_approval_authority),
+    db: Session = Depends(get_db),
+):
+    return DeviceService(db).approve_device_admin(
+        device_id=device_id,
+        context=context,
         client_ip=get_client_ip(request),
         user_agent=request.headers.get("User-Agent", "Desconocido"),
     )
@@ -212,12 +252,12 @@ def revoke_all_user_devices_admin(
     target_user_id: uuid.UUID,
     request: Request,
     body: Optional[dict] = None,
-    current_user: Usuario = Depends(verify_admin_role),
+    context: AuthenticatedSession = Depends(verify_admin_role),
     db: Session = Depends(get_db),
 ):
     return DeviceService(db).revoke_all_user_devices_admin(
         target_user_id=target_user_id,
-        admin_user=current_user,
+        context=context,
         motivo=(body or {}).get("motivo", "Revocación masiva de terminales por seguridad"),
         client_ip=get_client_ip(request),
         user_agent=request.headers.get("User-Agent", "Desconocido"),

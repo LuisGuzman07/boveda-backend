@@ -4,8 +4,8 @@ import uuid
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 from app.core.security import hash_token
-from app.models.auth import Sesion, SesionBoveda, Usuario
-from app.models.mfa import RecuperacionCuenta
+from app.models.auth import DesafioDispositivo, Sesion, SesionBoveda, Usuario
+from app.models.mfa import AutenticadorMfa, RecuperacionCuenta
 
 
 class RecoveryRepository:
@@ -19,6 +19,14 @@ class RecoveryRepository:
     def find_user_by_id(self, user_id: uuid.UUID) -> Optional[Usuario]:
         stmt = select(Usuario).where(Usuario.id_usuario == user_id)
         return self.db.scalars(stmt).first()
+
+    def find_user_by_id_for_update(self, user_id: uuid.UUID) -> Optional[Usuario]:
+        return self.db.scalars(
+            select(Usuario)
+            .where(Usuario.id_usuario == user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
 
     def create_recovery_token(
         self, user_id: uuid.UUID, raw_token: str, expires_in_minutes: int = 15
@@ -113,7 +121,11 @@ class RecoveryRepository:
         self, user_id: uuid.UUID, motivo: str = "RESTABLECIMIENTO_CONTRASENA"
     ) -> int:
         """Revoca todas las sesiones activas del usuario."""
+        user = self.find_user_by_id_for_update(user_id)
+        if not user:
+            return 0
         now = datetime.now(timezone.utc)
+        user.version_seguridad += 1
         stmt = select(Sesion).where(
             Sesion.id_usuario == user_id,
             Sesion.revocada == False,
@@ -131,5 +143,34 @@ class RecoveryRepository:
             .where(SesionBoveda.id_usuario == user_id, SesionBoveda.revocada.is_(False))
             .values(revocada=True, motivo_revocacion=motivo)
         )
+        self.db.execute(
+            update(DesafioDispositivo)
+            .where(
+                DesafioDispositivo.id_usuario == user_id,
+                DesafioDispositivo.consumido_en.is_(None),
+            )
+            .values(consumido_en=now, intentos=DesafioDispositivo.intentos + 1)
+        )
 
         return count
+
+    def revoke_mfa_and_backup_codes(self, user_id: uuid.UUID) -> None:
+        """Recovery removes every remaining MFA capability before committing reset."""
+        now = datetime.now(timezone.utc)
+        self.db.execute(
+            update(AutenticadorMfa)
+            .where(
+                AutenticadorMfa.id_usuario == user_id,
+                AutenticadorMfa.estado.in_(["PENDIENTE", "ACTIVO"]),
+            )
+            .values(estado="REVOCADO")
+        )
+        self.db.execute(
+            update(RecuperacionCuenta)
+            .where(
+                RecuperacionCuenta.id_usuario == user_id,
+                RecuperacionCuenta.tipo.in_(["BACKUP_CODE", "PENDING_BACKUP_CODE"]),
+                RecuperacionCuenta.utilizado.is_(False),
+            )
+            .values(utilizado=True, fecha_utilizacion=now)
+        )

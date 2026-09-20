@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import jwt
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPBearer
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -14,6 +15,7 @@ from app.core.device_crypto import DeviceCryptoError, verify_ed25519_signature
 from app.core.security import decode_token, get_jwt_secret
 from app.models.auth import Dispositivo, Sesion, SesionBoveda, Usuario
 from app.repositories.auth_repository import AuthRepository
+from app.repositories.mfa_repository import MfaRepository
 from app.schemas.vault import VaultSessionRequest
 from app.services.auth_service import AuthenticatedSession, get_current_auth_context
 from app.services.device_identity_service import CHALLENGE_VAULT, DeviceIdentityService
@@ -31,11 +33,24 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def active_session(
-    db: Session, session_id: uuid.UUID, user_id: uuid.UUID, device_id: uuid.UUID
+    db: Session,
+    session_id: uuid.UUID,
+    user_id: uuid.UUID,
+    device_id: uuid.UUID,
+    *,
+    lock: bool = False,
 ) -> tuple[Usuario, Dispositivo, Sesion]:
-    session = db.get(Sesion, session_id)
-    device = db.get(Dispositivo, device_id)
-    user = db.get(Usuario, user_id)
+    user_query = select(Usuario).where(Usuario.id_usuario == user_id)
+    device_query = select(Dispositivo).where(Dispositivo.id_dispositivo == device_id)
+    session_query = select(Sesion).where(Sesion.id_sesion == session_id)
+    if lock:
+        # Every vault/revocation flow acquires user, device, session, then vault-session.
+        user_query = user_query.with_for_update().execution_options(populate_existing=True)
+        device_query = device_query.with_for_update().execution_options(populate_existing=True)
+        session_query = session_query.with_for_update().execution_options(populate_existing=True)
+    user = db.scalars(user_query).first()
+    device = db.scalars(device_query).first()
+    session = db.scalars(session_query).first()
     now = datetime.now(timezone.utc)
     if (
         not session
@@ -58,6 +73,8 @@ def active_session(
         reject(403, "El dispositivo debe estar TRUSTED y vigente.")
     if not session.mfa_verificado_en:
         reject(403, "Se requiere MFA para abrir una sesión de bóveda.")
+    if not MfaRepository(db).get_active_mfa(user_id):
+        reject(403, "La configuración MFA actual no permite abrir una sesión de bóveda.")
     mfa_verified_at = _as_utc(session.mfa_verificado_en)
     if mfa_verified_at + timedelta(minutes=settings.MFA_VAULT_MAX_AGE_MINUTES) < now:
         reject(403, "La verificación MFA debe renovarse.")
@@ -68,7 +85,11 @@ def issue_vault_session(
     db: Session, context: AuthenticatedSession, body: VaultSessionRequest, request: Request
 ) -> dict:
     user, device, session = active_session(
-        db, context.session.id_sesion, context.user.id_usuario, context.device.id_dispositivo
+        db,
+        context.session.id_sesion,
+        context.user.id_usuario,
+        context.device.id_dispositivo,
+        lock=True,
     )
     DeviceIdentityService(db).prove_challenge(
         user,
@@ -80,6 +101,15 @@ def issue_vault_session(
         CHALLENGE_VAULT,
         client_ip=request.client.host if request.client else None,
         user_agent=request.headers.get("User-Agent", "Desconocido"),
+    )
+    # Proof commits its one-time consumption. Re-lock and revalidate before issuing
+    # a server capability so a revocation that won the race cannot be bypassed.
+    user, device, session = active_session(
+        db,
+        context.session.id_sesion,
+        context.user.id_usuario,
+        context.device.id_dispositivo,
+        lock=True,
     )
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(minutes=settings.VAULT_SESSION_EXPIRE_MINUTES)
@@ -159,7 +189,15 @@ async def get_vault_context(
     except (KeyError, TypeError, ValueError):
         reject(401, "Firma del dispositivo inválida.")
 
-    vault_session = db.get(SesionBoveda, vault_session_id)
+    # Hold the same canonical locks through the protected route. A remote revocation
+    # cannot commit between signature validation and a vault write.
+    user, device, session = active_session(db, session_id, user_id, device_id, lock=True)
+    vault_session = db.scalars(
+        select(SesionBoveda)
+        .where(SesionBoveda.id_sesion_boveda == vault_session_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
     now = datetime.now(timezone.utc)
     if (
         not vault_session
@@ -172,11 +210,43 @@ async def get_vault_context(
     ):
         reject(401, "Sesión de bóveda expirada o revocada.")
 
-    user, device, _ = active_session(db, session_id, user_id, device_id)
     try:
         verify_ed25519_signature(
             device.clave_firma_boveda or "", request.headers["X-Vault-Signature"], message
         )
     except (KeyError, DeviceCryptoError):
         reject(401, "Firma del dispositivo inválida.")
+    request.state.vault_session = vault_session
     return user, device
+
+
+def revoke_current_vault_session(
+    db: Session,
+    request: Request,
+    user: Usuario,
+    device: Dispositivo,
+) -> None:
+    """Revoke only the currently authenticated vault capability, idempotently."""
+    vault_session = getattr(request.state, "vault_session", None)
+    if not vault_session:
+        reject(401, "Sesión de bóveda expirada o revocada.")
+    result = db.execute(
+        update(SesionBoveda)
+        .where(
+            SesionBoveda.id_sesion_boveda == vault_session.id_sesion_boveda,
+            SesionBoveda.revocada.is_(False),
+        )
+        .values(revocada=True, motivo_revocacion="LOGOUT_BOVEDA_REMOTO")
+    )
+    if result.rowcount:
+        AuthRepository(db).add_audit_event(
+            accion="SESION_BOVEDA_REVOCADA",
+            tipo_evento="SEGURIDAD",
+            resultado="EXITO",
+            user_id=user.id_usuario,
+            device_id=device.id_dispositivo,
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("User-Agent", "Desconocido"),
+            detalles={"motivo": "LOGOUT_BOVEDA_REMOTO"},
+        )
+    db.commit()

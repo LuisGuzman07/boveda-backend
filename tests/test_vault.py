@@ -6,8 +6,10 @@ import uuid
 
 import jwt
 import pyotp
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import event, select
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -15,9 +17,10 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.security import get_jwt_secret
 from app.main import app
-from app.models.auth import SesionBoveda, Usuario
+from app.models.auth import Dispositivo, EventoAuditoria, Sesion, SesionBoveda, Usuario
 from app.models.mfa import AutenticadorMfa
 from app.models.vault import Boveda
+from app.services.vault_service import VaultService
 from app.services.totp_secret_service import get_totp_secret, store_encrypted_totp_secret
 from tests.helpers.device_identity import (
     current_device,
@@ -36,6 +39,13 @@ def _enable_mfa(email: str) -> str:
     try:
         user = db.scalars(select(Usuario).where(Usuario.correo == email)).first()
         assert user is not None
+        for existing in db.scalars(
+            select(AutenticadorMfa).where(
+                AutenticadorMfa.id_usuario == user.id_usuario,
+                AutenticadorMfa.estado == "ACTIVO",
+            )
+        ).all():
+            existing.estado = "REVOCADO"
         secret = pyotp.random_base32()
         mfa = AutenticadorMfa(id_usuario=user.id_usuario, tipo="TOTP", estado="ACTIVO")
         store_encrypted_totp_secret(mfa, secret)
@@ -52,12 +62,12 @@ def _vault_public_key(private_key: Ed25519PrivateKey) -> str:
     ).decode("ascii")
 
 
-def _mfa_login(identity, vault_signing_key):
-    secret = _enable_mfa("admin@boveda.com")
+def _mfa_login(identity, vault_signing_key, email="investigador@boveda.com", password="User1234!*"):
+    secret = _enable_mfa(email)
     login = login_with_device(
         client,
-        "admin@boveda.com",
-        "Admin1234!*",
+        email,
+        password,
         identity,
         _vault_public_key(vault_signing_key),
     )
@@ -70,11 +80,30 @@ def _mfa_login(identity, vault_signing_key):
     return verified.json()
 
 
+def _approve_device(device_id: str):
+    approver_identity = new_device_identity()
+    approver = _mfa_login(
+        approver_identity,
+        Ed25519PrivateKey.generate(),
+        email="admin@boveda.com",
+        password="Admin1234!*",
+    )
+    response = client.post(
+        f"/api/v1/devices/admin/{device_id}/approve",
+        headers={"Authorization": f"Bearer {approver['access_token']}"},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def _vault_session(identity):
     vault_signing_key = Ed25519PrivateKey.generate()
     login = _mfa_login(identity, vault_signing_key)
     access_token = login["access_token"]
-    prove_challenge(client, access_token, identity, "DEVICE_ENROLLMENT")
+    proof = prove_challenge(client, access_token, identity, "DEVICE_ENROLLMENT")
+    assert proof["dispositivo"]["estado"] == "PENDING"
+    approved = _approve_device(proof["dispositivo"]["id_dispositivo"])
+    assert approved["dispositivo"]["estado"] == "TRUSTED"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "X-Device-Id": identity.installation_id,
@@ -143,10 +172,18 @@ def _creation(device):
     }
 
 
-def _signed_request(signing_key, vault_token, method, path, body=None, retry_key="vault-retry-key-0001"):
+def _signed_request(
+    signing_key,
+    vault_token,
+    method,
+    path,
+    body=None,
+    retry_key="vault-retry-key-0001",
+    timestamp=None,
+):
     text = json.dumps(body, separators=(",", ":")) if body is not None else ""
     payload = jwt.decode(vault_token, get_jwt_secret(), algorithms=[settings.JWT_ALGORITHM])
-    timestamp = str(int(time.time()))
+    timestamp = str(timestamp if timestamp is not None else int(time.time()))
     message = "\n".join(
         [
             payload["jti"],
@@ -232,9 +269,10 @@ def test_vault_preserves_idempotency_and_rejects_invalid_bound_envelopes():
 
 def test_vault_session_rejects_missing_mfa_and_revocation_is_immediate():
     identity = new_device_identity()
-    plain_login = login_with_device(client, "admin@boveda.com", "Admin1234!*", identity)
+    plain_login = login_with_device(client, "investigador@boveda.com", "User1234!*", identity)
     access = plain_login["access_token"]
-    prove_challenge(client, access, identity, "DEVICE_ENROLLMENT")
+    proof = prove_challenge(client, access, identity, "DEVICE_ENROLLMENT")
+    _approve_device(proof["dispositivo"]["id_dispositivo"])
     denied = client.post(
         "/api/v1/devices/challenge",
         headers={"Authorization": f"Bearer {access}", "X-Device-Id": identity.installation_id},
@@ -252,3 +290,125 @@ def test_vault_session_rejects_missing_mfa_and_revocation_is_immediate():
     assert _signed_request(
         vault_signing_key, vault["access_token"], "GET", "/api/v1/vaults"
     ).status_code == 401
+
+
+def test_remote_vault_session_validation_and_revocation_are_signed_and_immediate():
+    identity = new_device_identity()
+    vault, _, _, vault_signing_key = _vault_session(identity)
+    token = vault["access_token"]
+
+    active = _signed_request(vault_signing_key, token, "GET", "/api/v1/vaults/session")
+    assert active.status_code == 200
+    assert active.json() == {"status": "active"}
+
+    revoked = _signed_request(vault_signing_key, token, "DELETE", "/api/v1/vaults/session")
+    assert revoked.status_code == 204
+    assert _signed_request(vault_signing_key, token, "GET", "/api/v1/vaults/session").status_code == 401
+
+
+def test_vault_requires_a_signed_device_bound_session():
+    identity = new_device_identity()
+    vault, _, device, vault_signing_key = _vault_session(identity)
+    body = _creation(device)
+    assert client.post(
+        "/api/v1/vaults",
+        json=body,
+        headers={"Idempotency-Key": "vault-missing-session-0001"},
+    ).status_code == 401
+    assert client.get(
+        "/api/v1/vaults",
+        headers={"Authorization": f"Bearer {vault['access_token']}"},
+    ).status_code == 401
+    assert _signed_request(
+        vault_signing_key,
+        vault["access_token"],
+        "POST",
+        "/api/v1/vaults",
+        body,
+        timestamp=int(time.time()) - 120,
+    ).status_code == 401
+
+
+@pytest.mark.parametrize("invalid_state", ["session", "device", "trust", "user", "permission", "key"])
+def test_vault_rejects_revoked_or_untrusted_server_state(invalid_state):
+    identity = new_device_identity()
+    vault, _, device_data, vault_signing_key = _vault_session(identity)
+    db = SessionLocal()
+    try:
+        device = db.get(Dispositivo, uuid.UUID(device_data["id_dispositivo"]))
+        assert device is not None
+        session = db.scalars(
+            select(Sesion).where(Sesion.id_dispositivo == device.id_dispositivo)
+        ).first()
+        user = db.get(Usuario, device.id_usuario)
+        assert session is not None and user is not None
+        if invalid_state == "session":
+            session.revocada = True
+        elif invalid_state == "device":
+            device.estado = "REVOKED"
+        elif invalid_state == "trust":
+            device.es_confiable = False
+        elif invalid_state == "user":
+            user.estado = "INACTIVO"
+        elif invalid_state == "permission":
+            user.roles = []
+        else:
+            device.clave_firma_boveda = new_device_identity().public_key
+        db.commit()
+    finally:
+        db.close()
+
+    rejected = _signed_request(
+        vault_signing_key,
+        vault["access_token"],
+        "POST",
+        "/api/v1/vaults",
+        _creation(device_data),
+    )
+    assert rejected.status_code in {401, 403}
+
+
+def test_vault_creation_rolls_back_when_its_audit_record_fails():
+    identity = new_device_identity()
+    vault, _, device, vault_signing_key = _vault_session(identity)
+
+    def reject_audit_insert(_mapper, _connection, _target):
+        raise RuntimeError("simulated audit failure")
+
+    event.listen(EventoAuditoria, "before_insert", reject_audit_insert)
+    try:
+        with pytest.raises(RuntimeError, match="simulated audit failure"):
+            _signed_request(
+                vault_signing_key,
+                vault["access_token"],
+                "POST",
+                "/api/v1/vaults",
+                _creation(device),
+            )
+    finally:
+        event.remove(EventoAuditoria, "before_insert", reject_audit_insert)
+
+    db = SessionLocal()
+    try:
+        assert db.scalars(select(Boveda)).first() is None
+    finally:
+        db.close()
+
+
+def test_other_device_cannot_retrieve_an_owner_envelope():
+    identity = new_device_identity()
+    vault, _, device, vault_signing_key = _vault_session(identity)
+    body = _creation(device)
+    created = _signed_request(vault_signing_key, vault["access_token"], "POST", "/api/v1/vaults", body)
+    assert created.status_code == 201
+
+    db = SessionLocal()
+    try:
+        owner = db.get(Usuario, uuid.UUID(device["id_usuario"]))
+        assert owner is not None
+        stranger = Dispositivo(id_dispositivo=uuid.uuid4())
+        with pytest.raises(HTTPException) as error:
+            VaultService(db).get_vault(owner, stranger, uuid.UUID(body["id_boveda"]))
+        assert getattr(error.value, "status_code", None) == 404
+    finally:
+        db.close()

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.auth import Usuario
+from app.repositories.auth_repository import AuthRepository
 from app.schemas.audit import AuditListResponse, AuditStatsResponse
 from app.services.auth_service import get_current_user
 from app.services.audit_service import AuditService
@@ -20,6 +21,18 @@ def verify_audit_permission(current_user: Usuario = Depends(get_current_user)) -
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No tienes los privilegios necesarios (audit:read) para consultar la bitácora de auditoría.",
+        )
+    return current_user
+
+
+def verify_audit_export_permission(current_user: Usuario = Depends(get_current_user)) -> Usuario:
+    """Export is intentionally more privileged than read-only audit access."""
+    user_roles = {role.nombre for role in current_user.roles}
+    user_perms = {permission.codigo for role in current_user.roles for permission in role.permisos}
+    if "audit:export" not in user_perms and "Administrador" not in user_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes los privilegios necesarios (audit:export) para exportar la bitácora.",
         )
     return current_user
 
@@ -78,7 +91,7 @@ def export_audit_csv(
     tipo_evento: Optional[str] = Query(None),
     resultado: Optional[str] = Query(None),
     query: Optional[str] = Query(None),
-    current_user: Usuario = Depends(verify_audit_permission),
+    current_user: Usuario = Depends(verify_audit_export_permission),
     db: Session = Depends(get_db),
 ):
     service = AuditService(db)
@@ -88,6 +101,13 @@ def export_audit_csv(
         tipo_evento=tipo_evento,
         resultado=resultado,
         query=query,
+    )
+    AuthRepository(db).create_audit_event(
+        accion="AUDITORIA_EXPORTADA",
+        tipo_evento="AUDITORIA",
+        resultado="EXITO",
+        user_id=current_user.id_usuario,
+        detalles={"formato": "CSV"},
     )
 
     filename = f"bitacora_auditoria_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
