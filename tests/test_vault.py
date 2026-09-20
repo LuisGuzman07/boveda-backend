@@ -1,15 +1,16 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 import time
 import uuid
 
 import jwt
 import pyotp
 import pytest
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import event, select
+from sqlalchemy import event, func, select
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -19,12 +20,10 @@ from app.core.security import get_jwt_secret
 from app.main import app
 from app.models.auth import Dispositivo, EventoAuditoria, Sesion, SesionBoveda, Usuario
 from app.models.mfa import AutenticadorMfa
-from app.models.vault import Boveda
-from app.services.vault_service import VaultService
-from app.services.totp_secret_service import get_totp_secret, store_encrypted_totp_secret
+from app.models.vault import Boveda, ClaveEnvuelta, MembresiaBoveda
+from app.services.totp_secret_service import store_encrypted_totp_secret
 from tests.helpers.device_identity import (
     current_device,
-    device_payload,
     login_with_device,
     new_device_identity,
     prove_challenge,
@@ -96,9 +95,9 @@ def _approve_device(device_id: str):
     return response.json()
 
 
-def _vault_session(identity):
+def _vault_session(identity, email="investigador@boveda.com", password="User1234!*"):
     vault_signing_key = Ed25519PrivateKey.generate()
-    login = _mfa_login(identity, vault_signing_key)
+    login = _mfa_login(identity, vault_signing_key, email=email, password=password)
     access_token = login["access_token"]
     proof = prove_challenge(client, access_token, identity, "DEVICE_ENROLLMENT")
     assert proof["dispositivo"]["estado"] == "PENDING"
@@ -180,6 +179,7 @@ def _signed_request(
     body=None,
     retry_key="vault-retry-key-0001",
     timestamp=None,
+    http_client=None,
 ):
     text = json.dumps(body, separators=(",", ":")) if body is not None else ""
     payload = jwt.decode(vault_token, get_jwt_secret(), algorithms=[settings.JWT_ALGORITHM])
@@ -194,7 +194,7 @@ def _signed_request(
             hashlib.sha256(text.encode("utf-8")).hexdigest(),
         ]
     ).encode("utf-8")
-    return client.request(
+    return (http_client or client).request(
         method,
         path,
         content=text,
@@ -371,6 +371,8 @@ def test_vault_rejects_revoked_or_untrusted_server_state(invalid_state):
 def test_vault_creation_rolls_back_when_its_audit_record_fails():
     identity = new_device_identity()
     vault, _, device, vault_signing_key = _vault_session(identity)
+    body = _creation(device)
+    retry_key = "vault-audit-rollback-0001"
 
     def reject_audit_insert(_mapper, _connection, _target):
         raise RuntimeError("simulated audit failure")
@@ -383,32 +385,216 @@ def test_vault_creation_rolls_back_when_its_audit_record_fails():
                 vault["access_token"],
                 "POST",
                 "/api/v1/vaults",
-                _creation(device),
+                body,
+                retry_key=retry_key,
             )
     finally:
         event.remove(EventoAuditoria, "before_insert", reject_audit_insert)
 
     db = SessionLocal()
     try:
-        assert db.scalars(select(Boveda)).first() is None
+        vault_id = uuid.UUID(body["id_boveda"])
+        assert db.scalar(select(func.count()).select_from(Boveda).where(Boveda.id_boveda == vault_id)) == 0
+        assert db.scalar(
+            select(func.count()).select_from(MembresiaBoveda).where(MembresiaBoveda.id_boveda == vault_id)
+        ) == 0
+        assert db.scalar(
+            select(func.count()).select_from(ClaveEnvuelta).where(ClaveEnvuelta.id_boveda == vault_id)
+        ) == 0
+        assert db.scalar(
+            select(func.count())
+            .select_from(EventoAuditoria)
+            .where(
+                EventoAuditoria.accion == "CREAR_BOVEDA",
+                EventoAuditoria.recurso_id == body["id_boveda"],
+            )
+        ) == 0
+    finally:
+        db.close()
+
+    created = _signed_request(
+        vault_signing_key,
+        vault["access_token"],
+        "POST",
+        "/api/v1/vaults",
+        body,
+        retry_key=retry_key,
+    )
+    retried = _signed_request(
+        vault_signing_key,
+        vault["access_token"],
+        "POST",
+        "/api/v1/vaults",
+        body,
+        retry_key=retry_key,
+    )
+    assert created.status_code == retried.status_code == 201
+    assert created.json() == retried.json()
+
+    db = SessionLocal()
+    try:
+        vault_id = uuid.UUID(body["id_boveda"])
+        assert db.scalar(select(func.count()).select_from(Boveda).where(Boveda.id_boveda == vault_id)) == 1
+        assert db.scalar(
+            select(func.count()).select_from(MembresiaBoveda).where(MembresiaBoveda.id_boveda == vault_id)
+        ) == 1
+        assert db.scalar(
+            select(func.count()).select_from(ClaveEnvuelta).where(ClaveEnvuelta.id_boveda == vault_id)
+        ) == 1
+        assert db.scalar(
+            select(func.count())
+            .select_from(EventoAuditoria)
+            .where(
+                EventoAuditoria.accion == "CREAR_BOVEDA",
+                EventoAuditoria.recurso_id == body["id_boveda"],
+            )
+        ) == 1
     finally:
         db.close()
 
 
-def test_other_device_cannot_retrieve_an_owner_envelope():
+def test_vault_envelopes_are_isolated_by_user_and_trusted_device():
+    owner_identity = new_device_identity()
+    vault, owner_access_token, owner_device, owner_signing_key = _vault_session(owner_identity)
+    body = _creation(owner_device)
+    created = _signed_request(owner_signing_key, vault["access_token"], "POST", "/api/v1/vaults", body)
+    assert created.status_code == 201
+
+    other_owner_device_identity = new_device_identity()
+    other_owner_vault, _, other_owner_device, other_owner_signing_key = _vault_session(
+        other_owner_device_identity
+    )
+    other_owner_list = _signed_request(
+        other_owner_signing_key,
+        other_owner_vault["access_token"],
+        "GET",
+        "/api/v1/vaults",
+    )
+    assert other_owner_list.status_code == 200
+    assert other_owner_list.json() == {"items": []}
+    assert _signed_request(
+        other_owner_signing_key,
+        other_owner_vault["access_token"],
+        "GET",
+        f"/api/v1/vaults/{body['id_boveda']}",
+    ).status_code == 404
+
+    other_email = f"vault-isolation-{uuid.uuid4().hex}@boveda.com"
+    other_password = f"Vault-{uuid.uuid4().hex}-1!"
+    registered = client.post(
+        "/api/v1/auth/register",
+        json={
+            "nombre": "Usuario de aislamiento",
+            "correo": other_email,
+            "password": other_password,
+        },
+    )
+    assert registered.status_code == 201, registered.text
+    stranger_identity = new_device_identity()
+    stranger_vault, _, _, stranger_signing_key = _vault_session(
+        stranger_identity,
+        email=other_email,
+        password=other_password,
+    )
+    stranger_list = _signed_request(
+        stranger_signing_key,
+        stranger_vault["access_token"],
+        "GET",
+        "/api/v1/vaults",
+    )
+    assert stranger_list.status_code == 200
+    assert stranger_list.json() == {"items": []}
+    assert _signed_request(
+        stranger_signing_key,
+        stranger_vault["access_token"],
+        "GET",
+        f"/api/v1/vaults/{body['id_boveda']}",
+    ).status_code == 404
+
+    forged_claims = jwt.decode(
+        other_owner_vault["access_token"], get_jwt_secret(), algorithms=[settings.JWT_ALGORITHM]
+    )
+    forged_claims["did"] = owner_device["id_dispositivo"]
+    tampered_device_token = jwt.encode(
+        forged_claims,
+        get_jwt_secret(),
+        algorithm=settings.JWT_ALGORITHM,
+    )
+    assert _signed_request(
+        other_owner_signing_key,
+        tampered_device_token,
+        "GET",
+        f"/api/v1/vaults/{body['id_boveda']}",
+    ).status_code == 401
+
+    bound_to_another_device = _creation(owner_device)
+    assert _signed_request(
+        other_owner_signing_key,
+        other_owner_vault["access_token"],
+        "POST",
+        "/api/v1/vaults",
+        bound_to_another_device,
+        retry_key="vault-envelope-device-tamper-0001",
+    ).status_code == 403
+
+    revoked = client.delete(
+        f"/api/v1/devices/{owner_device['id_dispositivo']}",
+        headers={"Authorization": f"Bearer {owner_access_token}"},
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert _signed_request(
+        owner_signing_key,
+        vault["access_token"],
+        "GET",
+        "/api/v1/vaults",
+    ).status_code == 401
+
+
+@pytest.mark.skipif(
+    os.getenv("CU06_TEST_POSTGRES") != "1",
+    reason="Concurrent idempotency relies on PostgreSQL transaction semantics.",
+)
+def test_postgres_concurrent_vault_retries_create_one_complete_record():
     identity = new_device_identity()
     vault, _, device, vault_signing_key = _vault_session(identity)
     body = _creation(device)
-    created = _signed_request(vault_signing_key, vault["access_token"], "POST", "/api/v1/vaults", body)
-    assert created.status_code == 201
+    retry_key = "vault-concurrent-retry-0001"
+
+    def create_from_independent_client():
+        with TestClient(app) as independent_client:
+            return _signed_request(
+                vault_signing_key,
+                vault["access_token"],
+                "POST",
+                "/api/v1/vaults",
+                body,
+                retry_key=retry_key,
+                http_client=independent_client,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _: create_from_independent_client(), range(2)))
+
+    assert first.status_code == second.status_code == 201
+    assert first.json() == second.json()
 
     db = SessionLocal()
     try:
-        owner = db.get(Usuario, uuid.UUID(device["id_usuario"]))
-        assert owner is not None
-        stranger = Dispositivo(id_dispositivo=uuid.uuid4())
-        with pytest.raises(HTTPException) as error:
-            VaultService(db).get_vault(owner, stranger, uuid.UUID(body["id_boveda"]))
-        assert getattr(error.value, "status_code", None) == 404
+        vault_id = uuid.UUID(body["id_boveda"])
+        assert db.scalar(select(func.count()).select_from(Boveda).where(Boveda.id_boveda == vault_id)) == 1
+        assert db.scalar(
+            select(func.count()).select_from(MembresiaBoveda).where(MembresiaBoveda.id_boveda == vault_id)
+        ) == 1
+        assert db.scalar(
+            select(func.count()).select_from(ClaveEnvuelta).where(ClaveEnvuelta.id_boveda == vault_id)
+        ) == 1
+        assert db.scalar(
+            select(func.count())
+            .select_from(EventoAuditoria)
+            .where(
+                EventoAuditoria.accion == "CREAR_BOVEDA",
+                EventoAuditoria.recurso_id == body["id_boveda"],
+            )
+        ) == 1
     finally:
         db.close()

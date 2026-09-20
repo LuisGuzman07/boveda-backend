@@ -72,6 +72,22 @@ def _approve_as_admin(device_id: str):
     return response.json()
 
 
+def test_authenticated_device_list_identifies_the_current_device():
+    identity, login = _admin_login()
+
+    response = client.get(
+        "/api/v1/devices",
+        headers={"Authorization": f"Bearer {login['access_token']}"},
+    )
+    assert response.status_code == 200, response.text
+    listed = response.json()
+    assert listed["total"] == len(listed["dispositivos"])
+    current = [device for device in listed["dispositivos"] if device["es_dispositivo_actual"]]
+    assert len(current) == 1
+    assert current[0]["identificador_seguro"] == identity.installation_id
+    assert listed["dispositivo_actual_id"] == current[0]["id_dispositivo"]
+
+
 def test_registration_is_pending_and_client_cannot_self_trust():
     identity, login = _admin_login()
     access_token = login["access_token"]
@@ -621,3 +637,58 @@ def test_non_owner_cannot_revoke_a_device():
         headers={"Authorization": f"Bearer {member_login['access_token']}"},
     )
     assert response.status_code == 404
+
+
+def test_administrator_lists_and_revokes_another_verified_device_with_audit():
+    member_identity = new_device_identity()
+    member = login_with_device(
+        client,
+        "investigador@boveda.com",
+        "User1234!*",
+        member_identity,
+    )
+    target = prove_challenge(
+        client,
+        member["access_token"],
+        member_identity,
+        "DEVICE_ENROLLMENT",
+    )["dispositivo"]
+    admin = _mfa_login("admin@boveda.com", "Admin1234!*", new_device_identity())
+    headers = {"Authorization": f"Bearer {admin['access_token']}"}
+
+    listed = client.get("/api/v1/devices/admin/all?estado=PENDING", headers=headers)
+    assert listed.status_code == 200, listed.text
+    matching = [
+        device
+        for device in listed.json()["dispositivos"]
+        if device["id_dispositivo"] == target["id_dispositivo"]
+    ]
+    assert len(matching) == 1
+    assert matching[0]["usuario_correo"] == "investigador@boveda.com"
+    assert matching[0]["estado"] == "PENDING"
+
+    revoked = client.post(
+        f"/api/v1/devices/admin/{target['id_dispositivo']}/revoke",
+        headers=headers,
+        json={"motivo": "Validación CU06 de revocación administrativa"},
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["dispositivo"]["estado"] == "REVOKED"
+    assert client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {member['access_token']}"},
+    ).status_code == 401
+
+    db = SessionLocal()
+    try:
+        event = db.scalars(
+            select(EventoAuditoria).where(
+                EventoAuditoria.accion == "REVOCACION_DISPOSITIVO_ADMIN",
+                EventoAuditoria.id_dispositivo == uuid.UUID(target["id_dispositivo"]),
+            )
+        ).first()
+        assert event is not None
+        assert event.resultado == "EXITO"
+        assert event.detalles["accion"] == "INVALIDACION_INMEDIATA_TERMINAL"
+    finally:
+        db.close()
