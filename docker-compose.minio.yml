@@ -1,0 +1,77 @@
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    profiles: ["storage"]
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [default, object_storage]
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    profiles: ["storage"]
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET:-boveda-ciphertext}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      OBJECT_STORE_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY}
+      OBJECT_STORE_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null
+        mc mb --ignore-existing "local/$$MINIO_BUCKET" >/dev/null
+        mc anonymous set none "local/$$MINIO_BUCKET" >/dev/null
+        if ! mc admin user info local "$$OBJECT_STORE_ACCESS_KEY" >/dev/null 2>&1; then
+          mc admin user add local "$$OBJECT_STORE_ACCESS_KEY" "$$OBJECT_STORE_SECRET_KEY" >/dev/null
+        fi
+        umask 077
+        cat > /tmp/runtime-policy.json <<EOF
+        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetBucketLocation","s3:PutObject","s3:GetObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::$$MINIO_BUCKET","arn:aws:s3:::$$MINIO_BUCKET/*"]}]}
+        EOF
+        mc admin policy create local boveda-ciphertext-runtime /tmp/runtime-policy.json >/dev/null 2>&1 || mc admin policy update local boveda-ciphertext-runtime /tmp/runtime-policy.json >/dev/null
+        mc admin policy attach local boveda-ciphertext-runtime --user "$$OBJECT_STORE_ACCESS_KEY" >/dev/null
+        rm -f /tmp/runtime-policy.json
+    networks: [object_storage]
+
+  backend:
+    profiles: ["storage"]
+    environment:
+      OBJECT_STORAGE_ENABLED: "true"
+      MINIO_INTERNAL_ENDPOINT: minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT}
+      MINIO_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-boveda-ciphertext}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      MINIO_SECURE: "false"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks: [default, object_storage]
+
+volumes:
+  minio_data:
+    name: boveda_minio_data
+
+networks:
+  object_storage:
+    internal: true

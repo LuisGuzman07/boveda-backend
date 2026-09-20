@@ -105,6 +105,52 @@ docker compose down -v
 
 ---
 
+## 5.1 Almacenamiento cifrado CU08 (MinIO)
+
+CU08 mantiene MinIO desactivado hasta que un operador entregue secretos reales en
+`.env`. El backend usa un usuario de runtime con acceso privado al bucket; no usa
+la cuenta root de MinIO. Define como mínimo valores fuertes y distintos para:
+
+```env
+MINIO_ROOT_USER=
+MINIO_ROOT_PASSWORD=
+OBJECT_STORE_ACCESS_KEY=
+OBJECT_STORE_SECRET_KEY=
+MINIO_BUCKET=boveda-ciphertext
+MINIO_PUBLIC_ENDPOINT=https://storage.example.com
+MINIO_REGION=us-east-1
+```
+
+Para desarrollo local, el overlay crea el bucket privado, el usuario runtime y la
+policy mínima. El backend recibe esas credenciales mediante `MINIO_ACCESS_KEY` y
+`MINIO_SECRET_KEY`; el compose las enlaza a `OBJECT_STORE_ACCESS_KEY` y
+`OBJECT_STORE_SECRET_KEY` para no entregar root al proceso FastAPI.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.minio.yml --profile storage up --build
+```
+
+`MINIO_INTERNAL_ENDPOINT=minio:9000` es exclusivo del backend dentro de Docker.
+`MINIO_PUBLIC_ENDPOINT` se entrega al móvil en la URL presignada y debe ser una
+URL HTTPS pública alcanzable por el dispositivo. El HTTP local sólo se admite con
+`MINIO_SECURE=false` y una URL loopback durante desarrollo; la configuración de
+producción lo rechaza. No expongas el puerto ni la consola de MinIO fuera de la
+red administrativa.
+
+La capacidad PUT apunta a un prefijo staging `uploads/`; FastAPI verifica tamaño
+y SHA-256 y copia el ciphertext a un prefijo final `files/` que nunca se entrega
+al cliente. Ejecuta periódicamente el reconciliador para borrar staging vencido:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.minio.yml --profile storage \
+  exec backend python scripts/reconcile_file_uploads.py
+```
+
+No imprimas ni almacenes `upload_url`, ciphertext, claves, nonce o tag en logs de
+operación.
+
+---
+
 ## 6. Cómo Reconstruir las Imágenes
 
 Si agregas dependencias en `requirements.txt` o modificas el `Dockerfile`:

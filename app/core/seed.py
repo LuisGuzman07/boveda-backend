@@ -54,6 +54,7 @@ def seed_database() -> None:
             ("users:assign_role", "Asignar Roles", "Permite asignar y revocar roles a usuarios"),
             ("vaults:create", "Crear Bóvedas", "Permite crear nuevas bóvedas de archivos"),
             ("vaults:read", "Consultar Bóvedas", "Permite ver bóvedas asignadas"),
+            ("vaults:write", "Cargar en Bóvedas", "Permite iniciar y completar cargas cifradas"),
             ("vaults:update", "Modificar Bóvedas", "Permite editar configuraciones de bóvedas"),
             ("vaults:delete", "Eliminar Bóvedas", "Permite eliminar bóvedas"),
             ("files:upload", "Subir Archivos", "Permite cargar y cifrar archivos"),
@@ -86,6 +87,7 @@ def seed_database() -> None:
                 [
                     permissions["vaults:create"],
                     permissions["vaults:read"],
+                    permissions["vaults:write"],
                     permissions["vaults:update"],
                     permissions["files:upload"],
                     permissions["files:read"],
