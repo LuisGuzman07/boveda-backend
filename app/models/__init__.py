@@ -13,6 +13,7 @@ from app.models.auth import (
 )
 from app.models.mfa import AutenticadorMfa, RecuperacionCuenta
 from app.models.vault import Boveda, MembresiaBoveda, ClaveEnvuelta
+from app.models.policy import PoliticaSeguridad
 
 __all__ = [
     "Usuario",
@@ -28,4 +29,5 @@ __all__ = [
     "Boveda",
     "MembresiaBoveda",
     "ClaveEnvuelta",
+    "PoliticaSeguridad",
 ]

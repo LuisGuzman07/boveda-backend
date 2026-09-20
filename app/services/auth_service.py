@@ -132,11 +132,23 @@ class AuthService:
 
         # 4. Validar contraseña
         if not verify_password(request.password, user.password_hash):
+            from app.repositories.policy_repository import PolicyRepository
+            pdict = PolicyRepository(self.db).get_effective_dict()
+            try:
+                max_attempts = int(pdict.get("MAX_FAILED_LOGIN_ATTEMPTS", str(settings.MAX_FAILED_LOGIN_ATTEMPTS)))
+            except (ValueError, TypeError):
+                max_attempts = settings.MAX_FAILED_LOGIN_ATTEMPTS
+
+            try:
+                lockout_mins = int(pdict.get("LOCKOUT_DURATION_MINUTES", str(settings.LOCKOUT_DURATION_MINUTES)))
+            except (ValueError, TypeError):
+                lockout_mins = settings.LOCKOUT_DURATION_MINUTES
+
             user.intentos_fallidos += 1
             detalles_audit = {"intentos": user.intentos_fallidos}
 
-            if user.intentos_fallidos >= settings.MAX_FAILED_LOGIN_ATTEMPTS:
-                user.bloqueado_hasta = now + timedelta(minutes=settings.LOCKOUT_DURATION_MINUTES)
+            if user.intentos_fallidos >= max_attempts:
+                user.bloqueado_hasta = now + timedelta(minutes=lockout_mins)
                 user.estado = "BLOQUEADO"
                 detalles_audit["bloqueado_hasta"] = user.bloqueado_hasta.isoformat()
 
@@ -152,10 +164,10 @@ class AuthService:
                 detalles=detalles_audit,
             )
 
-            if user.intentos_fallidos >= settings.MAX_FAILED_LOGIN_ATTEMPTS:
+            if user.intentos_fallidos >= max_attempts:
                 raise HTTPException(
                     status_code=status.HTTP_423_LOCKED,
-                    detail=f"Demasiados intentos fallidos. Cuenta bloqueada por {settings.LOCKOUT_DURATION_MINUTES} minutos.",
+                    detail=f"Demasiados intentos fallidos. Cuenta bloqueada por {lockout_mins} minutos.",
                 )
 
             raise HTTPException(

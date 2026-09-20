@@ -1,5 +1,5 @@
 from typing import Optional
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Header, Request, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.auth import Usuario
@@ -99,3 +99,41 @@ def get_me(
     current_user: Usuario = Depends(get_current_user),
 ):
     return current_user
+
+
+@router.post(
+    "/inactivity-lock",
+    summary="CU-12: Auditar bloqueo de sesión por inactividad",
+    description="Registra en la bitácora inmutable el bloqueo preventivo de la terminal tras período de inactividad.",
+)
+def record_inactivity_lock(
+    request: Request,
+    body: Optional[dict] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.schemas.policy import InactivityLockRequest
+    from app.services.policy_service import PolicyService
+    from app.repositories.device_repository import DeviceRepository
+
+    device_id = None
+    if x_device_id:
+        dev = DeviceRepository(db).get_device_by_secure_id(current_user.id_usuario, x_device_id)
+        if dev:
+            device_id = dev.id_dispositivo
+
+    lock_req = InactivityLockRequest(
+        motivo=body.get("motivo") if body and isinstance(body, dict) else "Bloqueo automático de terminal por inactividad prolongada (CU-12)"
+    )
+    service = PolicyService(db)
+    client_ip = get_client_ip(request)
+    user_agent = request.headers.get("User-Agent", "Desconocido")
+    return service.record_inactivity_lock(
+        user=current_user,
+        device_id=device_id,
+        request_data=lock_req,
+        client_ip=client_ip,
+        user_agent=user_agent,
+    )
+
