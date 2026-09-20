@@ -4,7 +4,7 @@ import uuid
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 from app.core.security import hash_token
-from app.models.auth import Sesion, Usuario
+from app.models.auth import Sesion, SesionBoveda, Usuario
 from app.models.mfa import RecuperacionCuenta
 
 
@@ -125,5 +125,11 @@ class RecoveryRepository:
             s.motivo_revocacion = motivo
             s.ultima_actividad = now
             self.db.add(s)
+
+        self.db.execute(
+            update(SesionBoveda)
+            .where(SesionBoveda.id_usuario == user_id, SesionBoveda.revocada.is_(False))
+            .values(revocada=True, motivo_revocacion=motivo)
+        )
 
         return count

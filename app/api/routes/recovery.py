@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
+from app.core.request_security import get_client_ip
 from app.schemas.recovery import (
     ForgotPasswordRequest,
     ForgotPasswordResponse,
@@ -12,10 +13,6 @@ from app.schemas.recovery import (
 from app.services.recovery_service import RecoveryService
 
 router = APIRouter(prefix="/auth/recovery", tags=["CU-03: Recuperación de Cuenta"])
-
-
-def get_client_ip(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
 
 
 def get_recovery_service(db: Session = Depends(get_db)) -> RecoveryService:

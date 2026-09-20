@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -9,13 +9,29 @@ class DeviceRegisterRequest(BaseModel):
     tipo: Optional[str] = Field("WEB", max_length=50, description="Tipo de dispositivo: WEB, DESKTOP, MOVIL")
     sistema_operativo: Optional[str] = Field(None, max_length=100, description="Sistema operativo detectado")
     identificador_seguro: str = Field(..., min_length=10, max_length=255, description="Huella digital persistente o UUID del cliente local")
-    public_key: Optional[str] = Field(None, description="Clave pública opcional para enlace criptográfico de hardware")
-    confiar_dispositivo: bool = Field(False, description="Si es True, solicita marcar este dispositivo como de confianza")
+    public_key: Optional[str] = Field(None, max_length=256, description="Clave pública Ed25519 codificada en base64")
+    vault_public_key: Optional[str] = Field(None, max_length=256, description="Clave pública CU06 por cuenta codificada en base64")
 
 
 class DeviceAuthorizeRequest(BaseModel):
-    es_confiable: bool = Field(True, description="True para autorizar como de confianza, False para revocar confianza")
     nombre: Optional[str] = Field(None, max_length=150, description="Nombre personalizado opcional para el dispositivo")
+
+
+class DeviceChallengeRequest(BaseModel):
+    proposito: Literal["DEVICE_ENROLLMENT", "VAULT_SESSION"]
+
+
+class DeviceChallengeResponse(BaseModel):
+    id_desafio: uuid.UUID
+    nonce: str
+    proposito: str
+    fecha_expiracion: datetime
+
+
+class DeviceChallengeProofRequest(BaseModel):
+    id_desafio: uuid.UUID
+    nonce: str = Field(min_length=32, max_length=512)
+    firma: str = Field(min_length=32, max_length=256)
 
 
 class DeviceRead(BaseModel):
@@ -27,7 +43,7 @@ class DeviceRead(BaseModel):
     tipo: Optional[str] = None
     sistema_operativo: Optional[str] = None
     identificador_seguro: str
-    public_key: Optional[str] = None
+    huella_clave_publica: Optional[str] = None
     es_confiable: bool
     estado: str
     fecha_registro: datetime

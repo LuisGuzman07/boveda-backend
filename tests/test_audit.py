@@ -1,28 +1,24 @@
 from fastapi.testclient import TestClient
-from sqlalchemy import select
-from app.core.database import SessionLocal
-from app.core.security import create_access_token
 from app.main import app
-from app.models.auth import Usuario
 
 client = TestClient(app)
 
 
 def get_user_token(email: str) -> str:
-    db = SessionLocal()
-    try:
-        user = db.scalars(select(Usuario).where(Usuario.correo == email)).first()
-        if not user:
-            raise ValueError(f"Usuario {email} no encontrado en base de datos.")
-        role_names = [r.nombre for r in user.roles]
-        perm_codes = list({p.codigo for r in user.roles for p in r.permisos})
-        return create_access_token(
-            subject=str(user.id_usuario),
-            roles=role_names,
-            permissions=perm_codes,
-        )
-    finally:
-        db.close()
+    password = "Admin1234!*" if email == "admin@boveda.com" else "User1234!*"
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "correo": email,
+            "password": password,
+            "dispositivo": {
+                "identificador_seguro": f"audit-{email.replace('@', '-').replace('.', '-')}",
+                "tipo": "WEB",
+            },
+        },
+    )
+    assert response.status_code == 200
+    return response.json()["access_token"]
 
 
 def test_get_audit_events_as_admin():

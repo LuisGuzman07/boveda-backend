@@ -1,9 +1,12 @@
 import uuid
+from datetime import datetime, timedelta, timezone
+
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from app.core.database import SessionLocal
 from app.main import app
 from app.models.auth import EventoAuditoria, Sesion, Usuario
+from app.core.config import settings
 
 client = TestClient(app)
 
@@ -126,6 +129,30 @@ def test_login_wrong_password():
     assert "Credenciales inválidas" in response.json()["detail"]
 
 
+def test_expired_temporary_lock_allows_login_again():
+    db = SessionLocal()
+    try:
+        user = db.scalars(select(Usuario).where(Usuario.correo == "admin@boveda.com")).first()
+        assert user is not None
+        user.estado = "BLOQUEADO"
+        user.intentos_fallidos = settings.MAX_FAILED_LOGIN_ATTEMPTS
+        user.bloqueado_hasta = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "correo": "admin@boveda.com",
+            "password": "Admin1234!*",
+            "dispositivo": {"identificador_seguro": "expired-lock-device", "tipo": "WEB"},
+        },
+    )
+
+    assert response.status_code == 200
+
+
 def test_get_me_and_refresh_and_logout():
     # 1. Login
     login_res = client.post(
@@ -152,7 +179,7 @@ def test_get_me_and_refresh_and_logout():
     )
     assert me_res.status_code == 200
     assert me_res.json()["correo"] == "investigador@boveda.com"
-    assert me_res.json()["nombre"] == "Dr. Luis Guzmán"
+    assert me_res.json()["nombre"] == "Miembro de Pruebas"
 
     # 3. Probar /refresh
     refresh_res = client.post(
@@ -171,3 +198,58 @@ def test_get_me_and_refresh_and_logout():
     )
     assert logout_res.status_code == 200
     assert logout_res.json()["status"] == "ok"
+
+
+def test_refresh_rotation_reuse_revokes_the_session_family():
+    login_res = client.post(
+        "/api/v1/auth/login",
+        json={
+            "correo": "admin@boveda.com",
+            "password": "Admin1234!*",
+            "dispositivo": {
+                "identificador_seguro": f"refresh-{uuid.uuid4()}",
+                "tipo": "WEB",
+            },
+        },
+    )
+    original_refresh = login_res.json()["refresh_token"]
+    rotated = client.post("/api/v1/auth/refresh", json={"refresh_token": original_refresh})
+    assert rotated.status_code == 200
+    fresh_access = rotated.json()["access_token"]
+    assert rotated.json()["refresh_token"] != original_refresh
+
+    replay = client.post("/api/v1/auth/refresh", json={"refresh_token": original_refresh})
+    assert replay.status_code == 401
+    assert client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {fresh_access}"}
+    ).status_code == 401
+
+
+def test_web_session_uses_http_only_cookie_and_csrf():
+    web_client = TestClient(app, base_url="https://testserver")
+    response = web_client.post(
+        "/api/v1/auth/web/login",
+        json={"correo": "admin@boveda.com", "password": "Admin1234!*"},
+    )
+    assert response.status_code == 200
+    assert response.json()["refresh_token"] is None
+    set_cookie = "\n".join(response.headers.get_list("set-cookie"))
+    assert settings.SESSION_COOKIE_NAME in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "Secure" in set_cookie
+    csrf_set_cookie = next(
+        cookie
+        for cookie in response.headers.get_list("set-cookie")
+        if cookie.startswith(f"{settings.CSRF_COOKIE_NAME}=")
+    )
+    assert "Path=/" in csrf_set_cookie
+    assert "HttpOnly" not in csrf_set_cookie
+
+    rejected = web_client.post("/api/v1/auth/web/refresh")
+    assert rejected.status_code == 403
+    csrf = web_client.cookies.get(settings.CSRF_COOKIE_NAME)
+    refreshed = web_client.post(
+        "/api/v1/auth/web/refresh", headers={"X-CSRF-Token": csrf}
+    )
+    assert refreshed.status_code == 200
+    assert refreshed.json()["access_token"]

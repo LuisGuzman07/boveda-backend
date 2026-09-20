@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
+from app.core.request_security import get_client_ip
 from app.models.auth import Usuario
 from app.schemas.auth import LoginResponse
 from app.schemas.mfa import (
@@ -14,13 +15,6 @@ from app.services.auth_service import get_current_user
 from app.services.mfa_service import MfaService
 
 router = APIRouter(prefix="/auth/mfa", tags=["MFA (Doble Factor)"])
-
-
-def get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "127.0.0.1"
 
 
 @router.post(

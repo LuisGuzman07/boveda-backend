@@ -44,8 +44,15 @@ class Settings(BaseSettings):
     # JWT & Authentication
     JWT_SECRET_KEY: SecretStr
     JWT_ALGORITHM: Literal["HS256"] = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 5
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    MFA_VAULT_MAX_AGE_MINUTES: int = 5
+    VAULT_SESSION_EXPIRE_MINUTES: int = 5
+    DEVICE_CHALLENGE_TTL_SECONDS: int = 120
+    SESSION_COOKIE_NAME: str = "boveda_refresh"
+    CSRF_COOKIE_NAME: str = "csrf_token"
+    SESSION_COOKIE_SECURE: bool = True
+    SESSION_COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
 
     # AES-256-GCM key encoded as URL-safe base64. It has no fallback by design.
     TOTP_ENCRYPTION_KEY: SecretStr
@@ -67,14 +74,20 @@ class Settings(BaseSettings):
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        origins: List[str]
         if isinstance(v, str):
             if v.startswith("[") and v.endswith("]"):
                 try:
-                    return json.loads(v)
+                    origins = json.loads(v)
                 except Exception:
-                    pass
-            return [i.strip() for i in v.split(",") if i.strip()]
-        return v
+                    origins = [i.strip() for i in v.split(",") if i.strip()]
+            else:
+                origins = [i.strip() for i in v.split(",") if i.strip()]
+        else:
+            origins = v
+        if not origins or "*" in origins:
+            raise ValueError("CORS_ORIGINS must list explicit origins when credentials are enabled.")
+        return origins
 
     @field_validator("JWT_SECRET_KEY")
     @classmethod

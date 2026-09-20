@@ -2,8 +2,10 @@ import secrets
 
 import pytest
 from pydantic import ValidationError
+from starlette.requests import Request
 
 from app.core.config import Settings
+from app.core.request_security import get_client_ip
 from app.core.security import (
     create_access_token,
     create_mfa_token,
@@ -59,3 +61,17 @@ def test_pytest_injected_secret_initializes_all_jwt_types():
         (create_mfa_token("user-id"), "mfa_pending"),
     ):
         assert decode_token(token)["type"] == token_type
+
+
+def test_client_ip_ignores_untrusted_forwarded_header():
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [(b"x-forwarded-for", b"198.51.100.10")],
+            "client": ("203.0.113.42", 443),
+        }
+    )
+
+    assert get_client_ip(request) == "203.0.113.42"

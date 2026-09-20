@@ -2,6 +2,7 @@ import base64
 from datetime import datetime, timedelta, timezone
 import io
 import secrets
+import hashlib
 from typing import List, Optional
 import uuid
 from fastapi import HTTPException, status
@@ -10,17 +11,16 @@ import qrcode
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.security import (
-    create_access_token,
-    create_refresh_token,
     decode_token,
-    hash_token,
     verify_password,
 )
-from app.models.auth import Usuario
+from app.models.auth import Dispositivo, Usuario
 from app.models.mfa import AutenticadorMfa
 from app.repositories.auth_repository import AuthRepository
 from app.repositories.mfa_repository import MfaRepository
 from app.services.totp_secret_service import get_totp_secret, store_encrypted_totp_secret
+from app.services.recovery_service import RecoveryRateLimiter
+from app.services.auth_service import AuthService, IssuedSession
 from app.schemas.auth import DispositivoInfo, LoginResponse, UsuarioRead
 from app.schemas.mfa import (
     MfaDisableRequest,
@@ -29,6 +29,9 @@ from app.schemas.mfa import (
     MfaStatusResponse,
     MfaVerifyLoginRequest,
 )
+
+
+mfa_login_rate_limiter = RecoveryRateLimiter(max_attempts=5, window_seconds=300)
 
 
 class MfaService:
@@ -164,7 +167,30 @@ class MfaService:
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> LoginResponse:
-        """Completa el inicio de sesión validando el código 2FA de la app móvil o un código de respaldo."""
+        response, _ = self._verify_login_mfa(
+            request, "NATIVE", client_ip=client_ip, user_agent=user_agent
+        )
+        return response
+
+    def verify_login_mfa_web(
+        self,
+        request: MfaVerifyLoginRequest,
+        client_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> tuple[LoginResponse, IssuedSession]:
+        response, issued = self._verify_login_mfa(
+            request, "WEB", client_ip=client_ip, user_agent=user_agent
+        )
+        return response, issued
+
+    def _verify_login_mfa(
+        self,
+        request: MfaVerifyLoginRequest,
+        expected_client_type: str,
+        client_ip: Optional[str],
+        user_agent: Optional[str],
+    ) -> tuple[LoginResponse, IssuedSession]:
+        """Completa el inicio de sesión con una identidad de dispositivo fijada antes del MFA."""
         payload = decode_token(request.mfa_token)
         if not payload or payload.get("type") != "mfa_pending":
             raise HTTPException(
@@ -172,8 +198,21 @@ class MfaService:
                 detail="Token de verificación MFA inválido o expirado.",
             )
 
-        user_id_str = payload.get("sub")
-        user = self.auth_repo.get_user_by_id(uuid.UUID(user_id_str))
+        try:
+            user_id = uuid.UUID(payload["sub"])
+            device_id = uuid.UUID(payload["did"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token de verificación MFA inválido o expirado.",
+            ) from error
+        if payload.get("client") != expected_client_type:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="El desafío MFA no pertenece a este tipo de cliente.",
+            )
+
+        user = self.auth_repo.get_user_by_id(user_id)
         if not user or user.estado != "ACTIVO":
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -185,6 +224,23 @@ class MfaService:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="El usuario no tiene MFA activo configurado.",
+            )
+
+        limiter_key = hashlib.sha256(
+            f"{user.id_usuario}:{client_ip or 'unknown'}".encode("utf-8")
+        ).hexdigest()
+        if not mfa_login_rate_limiter.allow(limiter_key):
+            self.auth_repo.create_audit_event(
+                accion="LOGIN_MFA_LIMITADO",
+                tipo_evento="AUTENTICACION",
+                resultado="DENEGADO",
+                user_id=user.id_usuario,
+                ip=client_ip,
+                user_agent=user_agent,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Demasiados intentos MFA. Intenta más tarde.",
             )
 
         # 1. Intentar validar código TOTP (6 dígitos)
@@ -220,30 +276,23 @@ class MfaService:
                 detail="Código de autenticación inválido o ya utilizado.",
             )
 
-        # 3. Éxito: Crear sesión y emitir JWTs finales
+        # The device comes from the MFA-pending token, never from a second client payload.
         now = datetime.now(timezone.utc)
-        device_info = request.dispositivo or DispositivoInfo()
-        if request.confiar_dispositivo is not None:
-            device_info.confiar_dispositivo = request.confiar_dispositivo
-        device = self.auth_repo.get_or_create_device(user.id_usuario, device_info)
-
-        role_names = [r.nombre for r in user.roles]
-        perm_codes = list({p.codigo for r in user.roles for p in r.permisos})
-
-        access_token = create_access_token(
-            subject=str(user.id_usuario),
-            roles=role_names,
-            permissions=perm_codes,
-        )
-        refresh_token = create_refresh_token(subject=str(user.id_usuario))
-
-        refresh_hash = hash_token(refresh_token)
-        refresh_expires = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-        self.auth_repo.create_session(
-            user_id=user.id_usuario,
-            device_id=device.id_dispositivo,
-            refresh_token_hash=refresh_hash,
-            expires_at=refresh_expires,
+        device = self.auth_repo.get_device_by_id(device_id)
+        if (
+            not device
+            or device.id_usuario != user.id_usuario
+            or device.estado == "REVOKED"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="El dispositivo asociado al desafío MFA ya no es válido.",
+            )
+        issued = AuthService(self.db).create_authenticated_session(
+            user,
+            device,
+            expected_client_type,
+            mfa_verified_at=now,
         )
 
         self.auth_repo.create_audit_event(
@@ -254,18 +303,9 @@ class MfaService:
             device_id=device.id_dispositivo,
             ip=client_ip,
             user_agent=user_agent,
-            detalles={"metodo": method_used, "roles": role_names},
+            detalles={"metodo": method_used, "cliente": expected_client_type},
         )
-
-        return LoginResponse(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            token_type="bearer",
-            expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-            usuario=UsuarioRead.model_validate(user),
-            roles=role_names,
-            permisos=perm_codes,
-        )
+        return issued.response, issued
 
     def disable_mfa(
         self,
