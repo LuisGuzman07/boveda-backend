@@ -58,6 +58,7 @@ def active_session(
         or _as_utc(session.fecha_expiracion) <= now
         or session.id_usuario != user_id
         or session.id_dispositivo != device_id
+        or session.version_seguridad != user.version_seguridad
     ):
         reject(401, "Sesión expirada o revocada.")
     if not user or user.estado != "ACTIVO":

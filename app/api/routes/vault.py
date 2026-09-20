@@ -53,5 +53,15 @@ def list_vaults(context=Depends(get_vault_context), db: Session = Depends(get_db
 
 
 @router.get("/{vault_id}")
-def get_vault(vault_id: uuid.UUID, context=Depends(get_vault_context), db: Session = Depends(get_db)):
-    return VaultService(db).get_vault(*context, vault_id)
+def get_vault(
+    vault_id: uuid.UUID,
+    request: Request,
+    context=Depends(get_vault_context),
+    db: Session = Depends(get_db),
+):
+    return VaultService(db).get_vault(
+        *context,
+        vault_id,
+        request.client.host if request.client else None,
+        request.headers.get("User-Agent", "Desconocido"),
+    )

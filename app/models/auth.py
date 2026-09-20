@@ -6,6 +6,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Table,
@@ -115,6 +116,16 @@ class Dispositivo(Base):
             "identificador_seguro",
             name="uq_dispositivo_usuario_identificador",
         ),
+        Index(
+            "ix_dispositivo_estado_identificador",
+            "estado",
+            "identificador_seguro",
+        ),
+        Index(
+            "ix_dispositivo_estado_huella_clave",
+            "estado",
+            "huella_clave_publica",
+        ),
     )
 
     id_dispositivo: Mapped[uuid.UUID] = mapped_column(
@@ -172,8 +183,8 @@ class IdentidadDispositivo(Base):
     )
     tipo: Mapped[str] = mapped_column(String(30), nullable=False)
     huella: Mapped[str] = mapped_column(String(64), nullable=False)
-    fecha_registro: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+    fecha_registro: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=True
     )
 
 
@@ -258,7 +269,7 @@ class SesionBoveda(Base):
     id_desafio: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("desafio_dispositivo.id_desafio", ondelete="CASCADE"), nullable=False, unique=True
     )
-    jti: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    jti: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     mfa_verificado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     fecha_expiracion: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revocada: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

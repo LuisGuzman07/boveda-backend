@@ -29,7 +29,6 @@ class Boveda(Base):
 class MembresiaBoveda(Base):
     __tablename__ = "membresia_boveda"
     __table_args__ = (
-        UniqueConstraint("id_boveda", "id_usuario", name="uq_membresia_boveda_usuario"),
         CheckConstraint("estado IN ('ACTIVA', 'REVOCADA')", name="ck_membresia_estado"),
     )
     id_boveda: Mapped[uuid.UUID] = mapped_column(ForeignKey("boveda.id_boveda"), primary_key=True)

@@ -1,5 +1,6 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -596,5 +597,182 @@ def test_postgres_concurrent_vault_retries_create_one_complete_record():
                 EventoAuditoria.recurso_id == body["id_boveda"],
             )
         ) == 1
+    finally:
+        db.close()
+
+
+def test_cu07_delivers_only_the_authorized_envelope_and_audits_the_delivery():
+    identity = new_device_identity()
+    vault, _, device, vault_signing_key = _vault_session(identity)
+    body = _creation(device)
+    created = _signed_request(vault_signing_key, vault["access_token"], "POST", "/api/v1/vaults", body)
+    assert created.status_code == 201
+
+    listed = _signed_request(vault_signing_key, vault["access_token"], "GET", "/api/v1/vaults")
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["items"] == [
+        {
+            "id_boveda": body["id_boveda"],
+            "estado": "ACTIVA",
+            "rol_usuario": "PROPIETARIO",
+            "version_criptografica": 1,
+            "fecha_creacion": listed.json()["items"][0]["fecha_creacion"],
+        }
+    ]
+
+    delivered = _signed_request(
+        vault_signing_key,
+        vault["access_token"],
+        "GET",
+        f"/api/v1/vaults/{body['id_boveda']}",
+    )
+    assert delivered.status_code == 200, delivered.text
+    response = delivered.json()
+    assert response["clave_envuelta"] == body["clave_envuelta"]
+    assert "password_maestra" not in response
+
+    db = SessionLocal()
+    try:
+        event = db.scalars(
+            select(EventoAuditoria).where(
+                EventoAuditoria.accion == "ENTREGAR_SOBRE_BOVEDA",
+                EventoAuditoria.recurso_id == body["id_boveda"],
+                EventoAuditoria.id_usuario == uuid.UUID(device["id_usuario"]),
+                EventoAuditoria.id_dispositivo == uuid.UUID(device["id_dispositivo"]),
+            )
+        ).first()
+        assert event is not None
+        assert event.resultado == "EXITO"
+        assert event.detalles == {"version_criptografica": 1, "version_clave": 1}
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("invalid_state", "expected_status"),
+    [
+        ("membership", 404),
+        ("envelope", 404),
+        ("security_version", 401),
+        ("mfa", 403),
+        ("permission", 403),
+    ],
+)
+def test_cu07_envelope_delivery_rechecks_current_server_authorization(
+    invalid_state, expected_status
+):
+    identity = new_device_identity()
+    vault, _, device_data, vault_signing_key = _vault_session(identity)
+    body = _creation(device_data)
+    assert _signed_request(
+        vault_signing_key, vault["access_token"], "POST", "/api/v1/vaults", body
+    ).status_code == 201
+
+    db = SessionLocal()
+    try:
+        user = db.get(Usuario, uuid.UUID(device_data["id_usuario"]))
+        device = db.get(Dispositivo, uuid.UUID(device_data["id_dispositivo"]))
+        assert user is not None and device is not None
+        if invalid_state == "membership":
+            membership = db.get(
+                MembresiaBoveda,
+                {"id_boveda": uuid.UUID(body["id_boveda"]), "id_usuario": user.id_usuario},
+            )
+            assert membership is not None
+            membership.estado = "REVOCADA"
+        elif invalid_state == "envelope":
+            envelope = db.scalars(
+                select(ClaveEnvuelta).where(
+                    ClaveEnvuelta.id_boveda == uuid.UUID(body["id_boveda"]),
+                    ClaveEnvuelta.id_dispositivo == device.id_dispositivo,
+                )
+            ).first()
+            assert envelope is not None
+            envelope.estado = "REVOCADA"
+        elif invalid_state == "security_version":
+            user.version_seguridad += 1
+        elif invalid_state == "mfa":
+            session = db.scalars(
+                select(Sesion).where(Sesion.id_dispositivo == device.id_dispositivo)
+            ).first()
+            assert session is not None
+            session.mfa_verificado_en = datetime.now(timezone.utc) - timedelta(
+                minutes=settings.MFA_VAULT_MAX_AGE_MINUTES + 1
+            )
+        else:
+            user.roles = []
+        db.commit()
+    finally:
+        db.close()
+
+    response = _signed_request(
+        vault_signing_key,
+        vault["access_token"],
+        "GET",
+        f"/api/v1/vaults/{body['id_boveda']}",
+    )
+    assert response.status_code == expected_status
+
+
+def test_cu07_rejects_tampered_signatures_and_master_password_fields():
+    identity = new_device_identity()
+    vault, _, device, vault_signing_key = _vault_session(identity)
+    body = _creation(device)
+    body["password_maestra"] = "must-not-be-accepted"
+    assert _signed_request(
+        vault_signing_key,
+        vault["access_token"],
+        "POST",
+        "/api/v1/vaults",
+        body,
+        retry_key="vault-no-master-password-0001",
+    ).status_code == 422
+
+    valid = _creation(device)
+    assert _signed_request(
+        vault_signing_key, vault["access_token"], "POST", "/api/v1/vaults", valid
+    ).status_code == 201
+    tampered = _signed_request(
+        Ed25519PrivateKey.generate(),
+        vault["access_token"],
+        "GET",
+        f"/api/v1/vaults/{valid['id_boveda']}",
+    )
+    assert tampered.status_code == 401
+
+
+def test_cu07_does_not_deliver_an_envelope_when_its_audit_record_fails():
+    identity = new_device_identity()
+    vault, _, device, vault_signing_key = _vault_session(identity)
+    body = _creation(device)
+    assert _signed_request(
+        vault_signing_key, vault["access_token"], "POST", "/api/v1/vaults", body
+    ).status_code == 201
+
+    def reject_audit_insert(_mapper, _connection, _target):
+        raise RuntimeError("simulated envelope delivery audit failure")
+
+    event.listen(EventoAuditoria, "before_insert", reject_audit_insert)
+    try:
+        with pytest.raises(RuntimeError, match="simulated envelope delivery audit failure"):
+            _signed_request(
+                vault_signing_key,
+                vault["access_token"],
+                "GET",
+                f"/api/v1/vaults/{body['id_boveda']}",
+            )
+    finally:
+        event.remove(EventoAuditoria, "before_insert", reject_audit_insert)
+
+    db = SessionLocal()
+    try:
+        assert db.scalar(
+            select(func.count())
+            .select_from(EventoAuditoria)
+            .where(
+                EventoAuditoria.accion == "ENTREGAR_SOBRE_BOVEDA",
+                EventoAuditoria.id_dispositivo == uuid.UUID(device["id_dispositivo"]),
+            )
+        ) == 0
     finally:
         db.close()
