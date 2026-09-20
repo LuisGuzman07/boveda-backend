@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 import hashlib
 from typing import List, Optional
 import uuid
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 from app.models.mfa import AutenticadorMfa, RecuperacionCuenta
 
@@ -50,6 +50,7 @@ class MfaRepository:
         # Invalidar códigos anteriores no utilizados
         old_stmt = select(RecuperacionCuenta).where(
             RecuperacionCuenta.id_usuario == user_id,
+            RecuperacionCuenta.tipo == "BACKUP_CODE",
             RecuperacionCuenta.utilizado == False,
         )
         for old in self.db.scalars(old_stmt).all():
@@ -76,16 +77,18 @@ class MfaRepository:
     def verify_and_consume_recovery_code(self, user_id: uuid.UUID, raw_code: str) -> bool:
         """Verifica y consume un código de recuperación."""
         code_hash = hashlib.sha256(raw_code.strip().encode("utf-8")).hexdigest()
-        stmt = select(RecuperacionCuenta).where(
-            RecuperacionCuenta.id_usuario == user_id,
-            RecuperacionCuenta.token_hash == code_hash,
-            RecuperacionCuenta.utilizado == False,
+        result = self.db.execute(
+            update(RecuperacionCuenta)
+            .where(
+                RecuperacionCuenta.id_usuario == user_id,
+                RecuperacionCuenta.token_hash == code_hash,
+                RecuperacionCuenta.tipo == "BACKUP_CODE",
+                RecuperacionCuenta.utilizado.is_(False),
+            )
+            .values(
+                utilizado=True,
+                fecha_utilizacion=datetime.now(timezone.utc),
+            )
         )
-        record = self.db.scalars(stmt).first()
-        if record:
-            record.utilizado = True
-            record.fecha_utilizacion = datetime.now(timezone.utc)
-            self.db.add(record)
-            self.db.commit()
-            return True
-        return False
+        self.db.commit()
+        return result.rowcount == 1

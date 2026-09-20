@@ -1,10 +1,10 @@
 from datetime import datetime, timedelta, timezone
-import hashlib
 from typing import Optional
 import uuid
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
-from app.models.auth import Sesion, Usuario
+from app.core.security import hash_token
+from app.models.auth import Sesion, SesionBoveda, Usuario
 from app.models.mfa import RecuperacionCuenta
 
 
@@ -38,25 +38,23 @@ class RecoveryRepository:
             old.fecha_utilizacion = now
             self.db.add(old)
 
-        token_hash = hashlib.sha256(raw_token.strip().encode("utf-8")).hexdigest()
         token_record = RecuperacionCuenta(
             id_recuperacion=uuid.uuid4(),
             id_usuario=user_id,
-            codigo=f"RST-{raw_token[:6].upper()}",
-            token_hash=token_hash,
+            codigo=f"REC-{uuid.uuid4().hex[:12].upper()}",
+            token_hash=hash_token(raw_token.strip()),
             tipo="RESET_TOKEN",
             utilizado=False,
             fecha_creacion=now,
             fecha_expiracion=expires_at,
         )
         self.db.add(token_record)
-        self.db.commit()
-        self.db.refresh(token_record)
+        self.db.flush()
         return token_record
 
     def get_valid_token_record(self, raw_token: str) -> Optional[RecuperacionCuenta]:
         """Obtiene el registro del token si existe, no ha sido usado y no ha expirado."""
-        token_hash = hashlib.sha256(raw_token.strip().encode("utf-8")).hexdigest()
+        token_hash = hash_token(raw_token.strip())
         stmt = select(RecuperacionCuenta).where(
             RecuperacionCuenta.token_hash == token_hash,
             RecuperacionCuenta.tipo == "RESET_TOKEN",
@@ -67,27 +65,49 @@ class RecoveryRepository:
             return None
 
         now = datetime.now(timezone.utc)
-        if record.fecha_expiracion and record.fecha_expiracion < now:
+        expires_at = record.fecha_expiracion
+        if expires_at and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at and expires_at < now:
             return None
 
         return record
 
-    def consume_token(self, token_record: RecuperacionCuenta) -> None:
-        """Marca el token como utilizado."""
+    def consume_token_if_valid(self, token_record: RecuperacionCuenta, raw_token: str) -> bool:
+        """Claims a token only if it is still unused and unexpired."""
+        now = datetime.now(timezone.utc)
+        statement = (
+            update(RecuperacionCuenta)
+            .where(
+                RecuperacionCuenta.id_recuperacion == token_record.id_recuperacion,
+                RecuperacionCuenta.token_hash == hash_token(raw_token.strip()),
+                RecuperacionCuenta.tipo == "RESET_TOKEN",
+                RecuperacionCuenta.utilizado.is_(False),
+                or_(
+                    RecuperacionCuenta.fecha_expiracion.is_(None),
+                    RecuperacionCuenta.fecha_expiracion > now,
+                ),
+            )
+            .values(utilizado=True, fecha_utilizacion=now)
+            .execution_options(synchronize_session=False)
+        )
+        result = self.db.execute(statement)
+        return result.rowcount == 1
+
+    def invalidate_token(self, token_record: RecuperacionCuenta) -> None:
+        """Makes a token unusable when email delivery did not complete."""
         token_record.utilizado = True
         token_record.fecha_utilizacion = datetime.now(timezone.utc)
         self.db.add(token_record)
-        self.db.commit()
 
     def update_user_password(self, user: Usuario, new_password_hash: str) -> None:
-        """Actualiza la contraseña y restablece bloqueos por intentos fallidos."""
+        """Stages a password change for the surrounding recovery transaction."""
         now = datetime.now(timezone.utc)
         user.password_hash = new_password_hash
         user.intentos_fallidos = 0
         user.bloqueado_hasta = None
         user.fecha_actualizacion = now
         self.db.add(user)
-        self.db.commit()
 
     def revoke_all_user_sessions(
         self, user_id: uuid.UUID, motivo: str = "RESTABLECIMIENTO_CONTRASENA"
@@ -106,5 +126,10 @@ class RecoveryRepository:
             s.ultima_actividad = now
             self.db.add(s)
 
-        self.db.commit()
+        self.db.execute(
+            update(SesionBoveda)
+            .where(SesionBoveda.id_usuario == user_id, SesionBoveda.revocada.is_(False))
+            .values(revocada=True, motivo_revocacion=motivo)
+        )
+
         return count

@@ -1,8 +1,16 @@
+from collections import deque
+from typing import Callable, Deque, Optional
+import hashlib
+import logging
 import secrets
-from typing import Optional
+import time
+import uuid
+
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
+
 from app.core.security import get_password_hash, verify_password
+from app.models.auth import EventoAuditoria
 from app.repositories.recovery_repository import RecoveryRepository
 from app.schemas.recovery import (
     ForgotPasswordRequest,
@@ -11,14 +19,80 @@ from app.schemas.recovery import (
     ResetPasswordResponse,
     ValidateTokenResponse,
 )
-from app.services.audit_service import log_audit_event
 from app.services.email_service import send_recovery_email
 
 
+logger = logging.getLogger(__name__)
+GENERIC_RECOVERY_MESSAGE = (
+    "Si el correo se encuentra registrado, recibiras instrucciones de recuperacion."
+)
+
+
+class RecoveryRateLimiter:
+    """Small process-local throttle for repeated recovery requests."""
+
+    def __init__(self, max_attempts: int = 3, window_seconds: int = 900):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self._attempts: dict[str, Deque[float]] = {}
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        attempts = self._attempts.setdefault(key, deque())
+        while attempts and now - attempts[0] >= self.window_seconds:
+            attempts.popleft()
+        if len(attempts) >= self.max_attempts:
+            return False
+        attempts.append(now)
+        return True
+
+
+recovery_rate_limiter = RecoveryRateLimiter()
+
+
 class RecoveryService:
-    def __init__(self, db: Session):
+    def __init__(
+        self,
+        db: Session,
+        email_sender: Callable[[str, str, int], bool] = send_recovery_email,
+        rate_limiter: Optional[RecoveryRateLimiter] = None,
+    ):
         self.db = db
         self.repo = RecoveryRepository(db)
+        self.email_sender = email_sender
+        self.rate_limiter = rate_limiter or recovery_rate_limiter
+
+    @staticmethod
+    def _request_key(email: str, client_ip: Optional[str]) -> str:
+        source = f"{email.lower().strip()}:{client_ip or 'unknown'}"
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _response() -> ForgotPasswordResponse:
+        return ForgotPasswordResponse(message=GENERIC_RECOVERY_MESSAGE)
+
+    def _add_audit(
+        self,
+        action: str,
+        result: str,
+        user_id: Optional[uuid.UUID],
+        client_ip: Optional[str],
+        user_agent: Optional[str],
+        details: Optional[dict] = None,
+    ) -> None:
+        self.db.add(
+            EventoAuditoria(
+                id_evento=uuid.uuid4(),
+                id_usuario=user_id,
+                accion=action,
+                tipo_evento="RECUPERACION",
+                resultado=result,
+                recurso_tipo="RECUPERACION_CUENTA",
+                direccion_ip=client_ip,
+                user_agent=user_agent,
+                detalles=details or {},
+            )
+        )
 
     def request_forgot_password(
         self,
@@ -26,101 +100,77 @@ class RecoveryService:
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> ForgotPasswordResponse:
-        """CU-03: Inicia solicitud de recuperación de cuenta y genera token seguro."""
+        """Starts recovery without disclosing whether the account exists."""
+        if not self.rate_limiter.allow(self._request_key(data.correo, client_ip)):
+            self._add_audit(
+                "SOLICITUD_RECUPERACION_LIMITADA",
+                "DENEGADO",
+                None,
+                client_ip,
+                user_agent,
+            )
+            self.db.commit()
+            return self._response()
+
         user = self.repo.find_user_by_email(data.correo)
-
         if not user:
-            # Registrar evento de auditoría por intento fallido sin revelar existencia del usuario
-            log_audit_event(
-                db=self.db,
-                user_id=None,
-                accion="SOLICITUD_RECUPERACION_FALLIDA",
-                tipo_evento="RECUPERACION",
-                resultado="FALLO",
-                recurso_tipo="USUARIO",
-                ip=client_ip,
-                user_agent=user_agent,
-                detalles={
-                    "correo_solicitado": data.correo,
-                    "motivo": "Usuario no registrado en el sistema",
-                },
+            self._add_audit(
+                "SOLICITUD_RECUPERACION",
+                "EXITO",
+                None,
+                client_ip,
+                user_agent,
             )
-            # Retornar mensaje estándar de seguridad para evitar enumeración de usuarios
-            return ForgotPasswordResponse(
-                message="Si el correo se encuentra registrado, se han generado las instrucciones de recuperación.",
-            )
+            self.db.commit()
+            return self._response()
 
-        # Generar token criptográficamente seguro
         raw_token = secrets.token_urlsafe(32)
-        expires_in = 15  # minutos de vigencia
+        expires_in = 15
         token_record = self.repo.create_recovery_token(
             user_id=user.id_usuario,
             raw_token=raw_token,
             expires_in_minutes=expires_in,
         )
 
-        simulation_url = f"http://localhost:5173/reset-password?token={raw_token}"
+        try:
+            email_sent = self.email_sender(user.correo, raw_token, expires_in)
+        except Exception:
+            logger.error("Recovery email delivery failed.")
+            email_sent = False
 
-        # 1. Despachar correo electrónico real vía SMTP si está configurado
-        email_sent = send_recovery_email(
-            to_email=user.correo,
-            reset_token=raw_token,
-            expires_in_minutes=expires_in,
-        )
+        if not email_sent:
+            self.repo.invalidate_token(token_record)
+            self._add_audit(
+                "SOLICITUD_RECUPERACION_NO_ENTREGADA",
+                "FALLO",
+                user.id_usuario,
+                client_ip,
+                user_agent,
+            )
+            self.db.commit()
+            return self._response()
 
-        # 2. Registrar auditoría exitosa (CU-21)
-        log_audit_event(
-            db=self.db,
-            user_id=user.id_usuario,
-            accion="SOLICITUD_RECUPERACION",
-            tipo_evento="RECUPERACION",
-            resultado="EXITO",
-            recurso_id=str(token_record.id_recuperacion),
-            recurso_tipo="RECUPERACION_CUENTA",
-            ip=client_ip,
-            user_agent=user_agent,
-            detalles={
-                "correo": user.correo,
-                "codigo_referencia": token_record.codigo,
-                "expira_en_minutos": expires_in,
-                "email_enviado": email_sent,
-            },
+        self._add_audit(
+            "SOLICITUD_RECUPERACION",
+            "EXITO",
+            user.id_usuario,
+            client_ip,
+            user_agent,
+            {"expira_en_minutos": expires_in},
         )
-
-        msg = (
-            f"Hemos enviado las instrucciones y el enlace de recuperación a tu cuenta {user.correo}."
-            if email_sent
-            else "Si el correo se encuentra registrado, se han generado las instrucciones de recuperación."
-        )
-
-        return ForgotPasswordResponse(
-            message=msg,
-            expires_in_minutes=expires_in,
-            email_sent=email_sent,
-            simulation_token=raw_token if not email_sent else None,
-            simulation_reset_url=simulation_url if not email_sent else None,
-        )
+        self.db.commit()
+        return self._response()
 
     def validate_token(self, token: str) -> ValidateTokenResponse:
-        """CU-03: Valida el estado de vigencia de un token de recuperación."""
-        token_record = self.repo.get_valid_token_record(token)
-        if not token_record:
+        """Checks a token without disclosing the account associated with it."""
+        if not self.repo.get_valid_token_record(token):
             return ValidateTokenResponse(
                 valid=False,
-                message="El enlace de recuperación es inválido, ya fue utilizado o ha expirado.",
+                message="El enlace de recuperacion es invalido, ya fue utilizado o ha expirado.",
             )
-
-        user = self.repo.find_user_by_id(token_record.id_usuario)
-        if not user:
-            return ValidateTokenResponse(
-                valid=False,
-                message="El usuario asociado a este token ya no existe.",
-            )
-
         return ValidateTokenResponse(
             valid=True,
-            correo=user.correo,
-            message="Token de recuperación verificado correctamente.",
+            message="Token de recuperacion verificado correctamente.",
         )
 
     def reset_password(
@@ -129,23 +179,20 @@ class RecoveryService:
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> ResetPasswordResponse:
-        """CU-03: Restablece credenciales, invalida token y revoca sesiones anteriores."""
+        """Resets credentials and consumes the token in one database transaction."""
         token_record = self.repo.get_valid_token_record(data.token)
         if not token_record:
-            log_audit_event(
-                db=self.db,
-                user_id=None,
-                accion="RESTABLECIMIENTO_PASSWORD_FALLIDO",
-                tipo_evento="RECUPERACION",
-                resultado="FALLO",
-                recurso_tipo="RECUPERACION_CUENTA",
-                ip=client_ip,
-                user_agent=user_agent,
-                detalles={"motivo": "Token inválido, expirado o ya utilizado"},
+            self._add_audit(
+                "RESTABLECIMIENTO_PASSWORD_FALLIDO",
+                "FALLO",
+                None,
+                client_ip,
+                user_agent,
             )
+            self.db.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="El enlace de recuperación es inválido, ya fue utilizado o ha expirado.",
+                detail="El enlace de recuperacion es invalido, ya fue utilizado o ha expirado.",
             )
 
         user = self.repo.find_user_by_id(token_record.id_usuario)
@@ -155,52 +202,55 @@ class RecoveryService:
                 detail="Usuario no encontrado.",
             )
 
-        # Validar que la nueva contraseña no sea idéntica a la actual
         if verify_password(data.password, user.password_hash):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="La nueva contraseña no puede ser idéntica a la contraseña actual.",
+                detail="La nueva contrasena no puede ser identica a la contrasena actual.",
             )
 
-        # 1. Actualizar contraseña y remover bloqueos por intentos fallidos
         new_hash = get_password_hash(data.password)
+        if not self.repo.consume_token_if_valid(token_record, data.token):
+            self.db.rollback()
+            self._add_audit(
+                "RESTABLECIMIENTO_PASSWORD_FALLIDO",
+                "FALLO",
+                None,
+                client_ip,
+                user_agent,
+            )
+            self.db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="El enlace de recuperacion es invalido, ya fue utilizado o ha expirado.",
+            )
+
         self.repo.update_user_password(user, new_hash)
-
-        # 2. Consumir token
-        self.repo.consume_token(token_record)
-
-        # 3. Revocar todas las sesiones activas anteriores
         revoked_sessions = self.repo.revoke_all_user_sessions(
             user.id_usuario, motivo="RESTABLECIMIENTO_CONTRASENA"
         )
 
         zero_knowledge_message = (
-            "La contraseña de tu cuenta ha sido restablecida exitosamente. "
-            "Tus bóvedas cifradas permanecen seguras e inalteradas bajo la arquitectura "
+            "La contrasena de tu cuenta ha sido restablecida exitosamente. "
+            "Tus bovedas cifradas permanecen seguras e inalteradas bajo la arquitectura "
             "de Cero Conocimiento (Zero-Knowledge), ya que sus claves maestras se derivan en tu dispositivo local."
         )
 
-        # 4. Registrar evento inmutable de auditoría (CU-21)
-        log_audit_event(
-            db=self.db,
-            user_id=user.id_usuario,
-            accion="RESTABLECIMIENTO_PASSWORD_EXITOSO",
-            tipo_evento="RECUPERACION",
-            resultado="EXITO",
-            recurso_id=str(user.id_usuario),
-            recurso_tipo="USUARIO",
-            ip=client_ip,
-            user_agent=user_agent,
-            detalles={
-                "correo": user.correo,
-                "sesiones_revocadas": revoked_sessions,
-                "token_id": str(token_record.id_recuperacion),
-                "zero_knowledge_garantizado": True,
-            },
+        self._add_audit(
+            "RESTABLECIMIENTO_PASSWORD_EXITOSO",
+            "EXITO",
+            user.id_usuario,
+            client_ip,
+            user_agent,
+            {"sesiones_revocadas": revoked_sessions, "zero_knowledge_garantizado": True},
         )
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
         return ResetPasswordResponse(
-            message="Contraseña actualizada exitosamente.",
+            message="Contrasena actualizada exitosamente.",
             sesiones_revocadas=revoked_sessions,
             zero_knowledge_notice=zero_knowledge_message,
         )

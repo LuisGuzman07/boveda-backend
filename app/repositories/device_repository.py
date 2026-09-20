@@ -3,7 +3,7 @@ from typing import List, Optional
 import uuid
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
-from app.models.auth import Dispositivo, Sesion
+from app.models.auth import Dispositivo, Sesion, SesionBoveda
 from app.schemas.device import DeviceRegisterRequest
 
 
@@ -17,7 +17,6 @@ class DeviceRepository:
             select(Dispositivo)
             .where(
                 Dispositivo.id_usuario == user_id,
-                Dispositivo.estado != "ELIMINADO",
             )
             .order_by(Dispositivo.ultimo_acceso.desc())
         )
@@ -56,12 +55,8 @@ class DeviceRepository:
                 device.tipo = data.tipo
             if data.sistema_operativo:
                 device.sistema_operativo = data.sistema_operativo
-            if data.public_key:
-                device.public_key = data.public_key
-            if data.confiar_dispositivo:
-                device.es_confiable = True
-            if device.estado == "REVOCADO":
-                device.estado = "ACTIVO"
+            if device.estado == "REVOKED":
+                raise ValueError("A revoked device cannot be re-registered.")
         else:
             device = Dispositivo(
                 id_usuario=user_id,
@@ -70,29 +65,13 @@ class DeviceRepository:
                 sistema_operativo=data.sistema_operativo or "Desconocido",
                 identificador_seguro=data.identificador_seguro,
                 public_key=data.public_key,
-                es_confiable=data.confiar_dispositivo,
-                estado="ACTIVO",
+                es_confiable=False,
+                estado="PENDING",
                 fecha_registro=now,
                 ultimo_acceso=now,
             )
             self.db.add(device)
 
-        self.db.commit()
-        self.db.refresh(device)
-        return device
-
-    def set_device_trust(
-        self,
-        device: Dispositivo,
-        es_confiable: bool,
-        nombre: Optional[str] = None,
-    ) -> Dispositivo:
-        """Establece o revoca el estado de confianza del dispositivo."""
-        device.es_confiable = es_confiable
-        device.ultimo_acceso = datetime.now(timezone.utc)
-        if nombre:
-            device.nombre = nombre
-        self.db.add(device)
         self.db.commit()
         self.db.refresh(device)
         return device
@@ -115,9 +94,21 @@ class DeviceRepository:
             )
         )
         self.db.execute(stmt_sessions)
+        self.db.execute(
+            update(SesionBoveda)
+            .where(
+                SesionBoveda.id_sesion.in_(
+                    select(Sesion.id_sesion).where(
+                        Sesion.id_dispositivo == device.id_dispositivo
+                    )
+                ),
+                SesionBoveda.revocada.is_(False),
+            )
+            .values(revocada=True, motivo_revocacion="DISPOSITIVO_REVOCADO")
+        )
 
         # Actualizar estado del dispositivo
-        device.estado = "REVOCADO"
+        device.estado = "REVOKED"
         device.es_confiable = False
         device.fecha_revocacion = now
         device.revocado_por = revocado_por
@@ -219,9 +210,21 @@ class DeviceRepository:
             )
         )
         self.db.execute(stmt_sessions)
+        self.db.execute(
+            update(SesionBoveda)
+            .where(
+                SesionBoveda.id_sesion.in_(
+                    select(Sesion.id_sesion).where(
+                        Sesion.id_dispositivo == device.id_dispositivo
+                    )
+                ),
+                SesionBoveda.revocada.is_(False),
+            )
+            .values(revocada=True, motivo_revocacion="DISPOSITIVO_REVOCADO_ADMIN")
+        )
 
         # Invalida el dispositivo
-        device.estado = "REVOCADO"
+        device.estado = "REVOKED"
         device.es_confiable = False
         device.fecha_revocacion = now
         device.revocado_por = admin_id
@@ -248,13 +251,23 @@ class DeviceRepository:
             )
         )
         self.db.execute(stmt_sessions)
+        self.db.execute(
+            update(SesionBoveda)
+            .where(
+                SesionBoveda.id_sesion.in_(
+                    select(Sesion.id_sesion).where(Sesion.id_usuario == user_id)
+                ),
+                SesionBoveda.revocada.is_(False),
+            )
+            .values(revocada=True, motivo_revocacion="DISPOSITIVO_REVOCADO_ADMIN")
+        )
 
         # 2. Revocar todos los dispositivos del usuario
         stmt_devices = (
             update(Dispositivo)
-            .where(Dispositivo.id_usuario == user_id, Dispositivo.estado != "REVOCADO")
+            .where(Dispositivo.id_usuario == user_id, Dispositivo.estado != "REVOKED")
             .values(
-                estado="REVOCADO",
+                estado="REVOKED",
                 es_confiable=False,
                 fecha_revocacion=now,
                 revocado_por=admin_id,

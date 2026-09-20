@@ -1,171 +1,185 @@
 from typing import Optional
 import uuid
-from fastapi import APIRouter, Depends, Header, Request, status
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
+
 from app.core.database import get_db
+from app.core.request_security import get_client_ip
 from app.models.auth import Usuario
 from app.schemas.device import (
     DeviceActionResponse,
     DeviceAuthorizeRequest,
+    DeviceChallengeProofRequest,
+    DeviceChallengeRequest,
+    DeviceChallengeResponse,
     DeviceListResponse,
+    DeviceRead,
     DeviceRegisterRequest,
 )
-from app.services.auth_service import get_current_user
+from app.services.auth_service import AuthenticatedSession, get_current_auth_context, get_current_user
+from app.services.device_identity_service import (
+    CHALLENGE_ENROLLMENT,
+    DeviceIdentityService,
+)
 from app.services.device_service import DeviceService
 
-router = APIRouter(prefix="/devices", tags=["Dispositivos de Confianza (CU-04)"])
+
+router = APIRouter(prefix="/devices", tags=["Dispositivos"])
 
 
-def get_client_ip(request: Request) -> str:
-    """Extrae la IP real del cliente detrás de proxies o de la conexión directa."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "127.0.0.1"
+def _require_current_installation(
+    context: AuthenticatedSession, installation_id: Optional[str]
+) -> None:
+    if installation_id and installation_id != context.device.identificador_seguro:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="La solicitud no corresponde al dispositivo de la sesión activa.",
+        )
 
 
-@router.get(
-    "",
-    response_model=DeviceListResponse,
-    summary="CU-04: Listar dispositivos vinculados a la cuenta",
-    description="Retorna el inventario de terminales, indicando estado de confianza, sistema operativo y cuál corresponde a la sesión activa.",
-)
+@router.get("", response_model=DeviceListResponse)
 def list_devices(
+    context: AuthenticatedSession = Depends(get_current_auth_context),
+    db: Session = Depends(get_db),
+):
+    return DeviceService(db).list_devices(
+        user=context.user,
+        current_device_id=context.device.id_dispositivo,
+    )
+
+
+@router.post("/register", response_model=DeviceActionResponse, status_code=status.HTTP_201_CREATED)
+def register_device(
+    device_data: DeviceRegisterRequest,
     request: Request,
     x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
-    current_user: Usuario = Depends(get_current_user),
+    context: AuthenticatedSession = Depends(get_current_auth_context),
     db: Session = Depends(get_db),
 ):
-    service = DeviceService(db)
-    return service.list_devices(
-        user=current_user,
-        current_device_identifier=x_device_id,
-    )
-
-
-@router.post(
-    "/register",
-    response_model=DeviceActionResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="CU-04: Registrar o sincronizar hardware/navegador local",
-    description="Enlaza el hardware local mediante su identificador criptográfico seguro persistente y metadatos de entorno.",
-)
-def register_device(
-    request: Request,
-    device_data: DeviceRegisterRequest,
-    current_user: Usuario = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    service = DeviceService(db)
-    client_ip = get_client_ip(request)
-    user_agent = request.headers.get("User-Agent", "Desconocido")
-    return service.register_device(
-        user=current_user,
+    _require_current_installation(context, x_device_id)
+    return DeviceService(db).register_device(
+        user=context.user,
+        current_device=context.device,
         request=device_data,
-        client_ip=client_ip,
-        user_agent=user_agent,
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
     )
 
 
-@router.post(
-    "/{device_id}/authorize",
-    response_model=DeviceActionResponse,
-    summary="CU-04: Autorizar terminal como Dispositivo de Confianza",
-    description="Eleva el dispositivo al estado de confianza ('es_confiable = True'), auditando el cambio de nivel de seguridad.",
-)
+@router.post("/challenge", response_model=DeviceChallengeResponse)
+def issue_device_challenge(
+    body: DeviceChallengeRequest,
+    request: Request,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    context: AuthenticatedSession = Depends(get_current_auth_context),
+    db: Session = Depends(get_db),
+):
+    _require_current_installation(context, x_device_id)
+    challenge, nonce = DeviceIdentityService(db).issue_challenge(
+        context.user,
+        context.session,
+        context.device,
+        body.proposito,
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
+    )
+    return DeviceChallengeResponse(
+        id_desafio=challenge.id_desafio,
+        nonce=nonce,
+        proposito=challenge.proposito,
+        fecha_expiracion=challenge.fecha_expiracion,
+    )
+
+
+@router.post("/challenge/prove", response_model=DeviceActionResponse)
+def prove_device_challenge(
+    body: DeviceChallengeProofRequest,
+    request: Request,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    context: AuthenticatedSession = Depends(get_current_auth_context),
+    db: Session = Depends(get_db),
+):
+    _require_current_installation(context, x_device_id)
+    # The persisted challenge determines its own purpose; callers cannot upgrade it.
+    from app.models.auth import DesafioDispositivo
+
+    stored_challenge = db.get(DesafioDispositivo, body.id_desafio)
+    if not stored_challenge:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Desafio de dispositivo invalido o expirado.")
+    DeviceIdentityService(db).prove_challenge(
+        context.user,
+        context.session,
+        context.device,
+        body.id_desafio,
+        body.nonce,
+        body.firma,
+        stored_challenge.proposito,
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
+    )
+    db.refresh(context.device)
+    return DeviceActionResponse(
+        message=(
+            "Identidad de dispositivo verificada y marcada como TRUSTED."
+            if stored_challenge.proposito == CHALLENGE_ENROLLMENT
+            else "Prueba de posesión del dispositivo verificada."
+        ),
+        dispositivo=DeviceRead.model_validate(context.device),
+    )
+
+
+@router.post("/{device_id}/authorize", response_model=DeviceActionResponse)
 def authorize_device(
     device_id: uuid.UUID,
-    request: Request,
     body: Optional[DeviceAuthorizeRequest] = None,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
-    current_user: Usuario = Depends(get_current_user),
-    db: Session = Depends(get_db),
 ):
-    service = DeviceService(db)
-    client_ip = get_client_ip(request)
-    user_agent = request.headers.get("User-Agent", "Desconocido")
-    auth_request = body or DeviceAuthorizeRequest(es_confiable=True)
-    return service.authorize_device(
-        device_id=device_id,
-        user=current_user,
-        request=auth_request,
-        current_device_identifier=x_device_id,
-        client_ip=client_ip,
-        user_agent=user_agent,
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="La autorización directa fue retirada. Usa el desafío criptográfico del dispositivo.",
     )
 
 
-@router.post(
-    "/{device_id}/revoke-trust",
-    response_model=DeviceActionResponse,
-    summary="CU-04: Revocar estado de confianza de un dispositivo",
-    description="Revoca la condición de dispositivo de confianza ('es_confiable = False') manteniendo el historial de la terminal.",
-)
+@router.post("/{device_id}/revoke-trust", response_model=DeviceActionResponse)
 def revoke_device_trust(
     device_id: uuid.UUID,
     request: Request,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
-    current_user: Usuario = Depends(get_current_user),
+    context: AuthenticatedSession = Depends(get_current_auth_context),
     db: Session = Depends(get_db),
 ):
-    service = DeviceService(db)
-    client_ip = get_client_ip(request)
-    user_agent = request.headers.get("User-Agent", "Desconocido")
-    auth_request = DeviceAuthorizeRequest(es_confiable=False)
-    return service.authorize_device(
+    return DeviceService(db).revoke_device(
         device_id=device_id,
-        user=current_user,
-        request=auth_request,
-        current_device_identifier=x_device_id,
-        client_ip=client_ip,
-        user_agent=user_agent,
+        user=context.user,
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
     )
 
 
-@router.delete(
-    "/{device_id}",
-    response_model=DeviceActionResponse,
-    summary="CU-04 / CU-05: Desvincular dispositivo y revocar sesiones",
-    description="Marca el dispositivo como revocado e invalida de forma inmediata todas las sesiones activas asociadas a él.",
-)
+@router.delete("/{device_id}", response_model=DeviceActionResponse)
 def delete_device(
     device_id: uuid.UUID,
     request: Request,
-    current_user: Usuario = Depends(get_current_user),
+    context: AuthenticatedSession = Depends(get_current_auth_context),
     db: Session = Depends(get_db),
 ):
-    service = DeviceService(db)
-    client_ip = get_client_ip(request)
-    user_agent = request.headers.get("User-Agent", "Desconocido")
-    return service.revoke_device(
+    return DeviceService(db).revoke_device(
         device_id=device_id,
-        user=current_user,
-        client_ip=client_ip,
-        user_agent=user_agent,
+        user=context.user,
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
     )
 
 
-# ==============================================================================
-# CU-05: ENDPOINTS ADMINISTRATIVOS (ACTOR: ADMINISTRADOR)
-# ==============================================================================
-
 def verify_admin_role(current_user: Usuario = Depends(get_current_user)) -> Usuario:
-    """Verifica que el usuario solicitante posea el rol de Administrador."""
-    roles = [r.nombre for r in current_user.roles]
-    if "Administrador" not in roles:
-        from fastapi import HTTPException
+    if "Administrador" not in {role.nombre for role in current_user.roles}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Acceso restringido: Se requieren privilegios de Administrador para gestionar terminales globales.",
+            detail="Acceso restringido: se requieren privilegios de Administrador.",
         )
     return current_user
 
 
-@router.get(
-    "/admin/all",
-    summary="CU-05: Inventario global de terminales (Admin)",
-    description="Permite a los administradores auditar todos los dispositivos registrados en la plataforma con estado y sesiones activas.",
-)
+@router.get("/admin/all")
 def list_all_devices_admin(
     query: Optional[str] = None,
     solo_confiables: Optional[bool] = None,
@@ -173,20 +187,10 @@ def list_all_devices_admin(
     current_user: Usuario = Depends(verify_admin_role),
     db: Session = Depends(get_db),
 ):
-    service = DeviceService(db)
-    return service.list_all_devices_admin(
-        query=query,
-        solo_confiables=solo_confiables,
-        estado=estado,
-    )
+    return DeviceService(db).list_all_devices_admin(query, solo_confiables, estado)
 
 
-@router.post(
-    "/admin/{device_id}/revoke",
-    response_model=DeviceActionResponse,
-    summary="CU-05: Revocación administrativa forzada de dispositivo y sesiones",
-    description="Invalida de inmediato la terminal de cualquier usuario y cierra todas sus sesiones activas ante incidentes de seguridad.",
-)
+@router.post("/admin/{device_id}/revoke", response_model=DeviceActionResponse)
 def revoke_device_admin(
     device_id: uuid.UUID,
     request: Request,
@@ -194,24 +198,16 @@ def revoke_device_admin(
     current_user: Usuario = Depends(verify_admin_role),
     db: Session = Depends(get_db),
 ):
-    service = DeviceService(db)
-    client_ip = get_client_ip(request)
-    user_agent = request.headers.get("User-Agent", "Desconocido")
-    motivo = (body or {}).get("motivo", "Revocación administrativa preventiva de seguridad")
-    return service.revoke_device_admin(
+    return DeviceService(db).revoke_device_admin(
         device_id=device_id,
         admin_user=current_user,
-        motivo=motivo,
-        client_ip=client_ip,
-        user_agent=user_agent,
+        motivo=(body or {}).get("motivo", "Revocación administrativa preventiva de seguridad"),
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
     )
 
 
-@router.post(
-    "/admin/user/{target_user_id}/revoke-all",
-    summary="CU-05: Expulsión total de terminales de una cuenta (Admin)",
-    description="Revoca todas las terminales y sesiones activas de un usuario ante compromiso de cuenta o sospecha de ataque.",
-)
+@router.post("/admin/user/{target_user_id}/revoke-all")
 def revoke_all_user_devices_admin(
     target_user_id: uuid.UUID,
     request: Request,
@@ -219,14 +215,10 @@ def revoke_all_user_devices_admin(
     current_user: Usuario = Depends(verify_admin_role),
     db: Session = Depends(get_db),
 ):
-    service = DeviceService(db)
-    client_ip = get_client_ip(request)
-    user_agent = request.headers.get("User-Agent", "Desconocido")
-    motivo = (body or {}).get("motivo", "Revocación masiva de terminales por compromiso de cuenta")
-    return service.revoke_all_user_devices_admin(
+    return DeviceService(db).revoke_all_user_devices_admin(
         target_user_id=target_user_id,
         admin_user=current_user,
-        motivo=motivo,
-        client_ip=client_ip,
-        user_agent=user_agent,
+        motivo=(body or {}).get("motivo", "Revocación masiva de terminales por seguridad"),
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
     )

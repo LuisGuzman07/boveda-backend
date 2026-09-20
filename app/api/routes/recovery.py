@@ -1,12 +1,13 @@
-from typing import Optional
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
+from app.core.request_security import get_client_ip
 from app.schemas.recovery import (
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     ResetPasswordRequest,
     ResetPasswordResponse,
+    ValidateTokenRequest,
     ValidateTokenResponse,
 )
 from app.services.recovery_service import RecoveryService
@@ -14,11 +15,8 @@ from app.services.recovery_service import RecoveryService
 router = APIRouter(prefix="/auth/recovery", tags=["CU-03: Recuperación de Cuenta"])
 
 
-def get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "127.0.0.1"
+def get_recovery_service(db: Session = Depends(get_db)) -> RecoveryService:
+    return RecoveryService(db)
 
 
 @router.post(
@@ -31,26 +29,24 @@ def get_client_ip(request: Request) -> str:
 def forgot_password(
     body: ForgotPasswordRequest,
     request: Request,
-    db: Session = Depends(get_db),
+    service: RecoveryService = Depends(get_recovery_service),
 ):
-    service = RecoveryService(db)
     client_ip = get_client_ip(request)
     user_agent = request.headers.get("User-Agent", "Desconocido")
     return service.request_forgot_password(body, client_ip=client_ip, user_agent=user_agent)
 
 
-@router.get(
+@router.post(
     "/validate-token",
     response_model=ValidateTokenResponse,
     summary="CU-03: Validar estado de token de recuperación",
-    description="Comprueba si el token proporcionado existe, no ha sido utilizado y se encuentra dentro de su ventana de expiración.",
+    description="Checks whether a mail-delivered token is still valid without exposing it in a URL or disclosing the associated account.",
 )
 def validate_token(
-    token: str = Query(..., min_length=10, description="Token recibido para validar"),
-    db: Session = Depends(get_db),
+    body: ValidateTokenRequest,
+    service: RecoveryService = Depends(get_recovery_service),
 ):
-    service = RecoveryService(db)
-    return service.validate_token(token)
+    return service.validate_token(body.token)
 
 
 @router.post(
@@ -62,9 +58,8 @@ def validate_token(
 def reset_password(
     body: ResetPasswordRequest,
     request: Request,
-    db: Session = Depends(get_db),
+    service: RecoveryService = Depends(get_recovery_service),
 ):
-    service = RecoveryService(db)
     client_ip = get_client_ip(request)
     user_agent = request.headers.get("User-Agent", "Desconocido")
     return service.reset_password(body, client_ip=client_ip, user_agent=user_agent)

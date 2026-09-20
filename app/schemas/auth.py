@@ -29,8 +29,10 @@ class DispositivoInfo(BaseModel):
     nombre: Optional[str] = "Navegador Web"
     tipo: Optional[str] = "WEB"
     sistema_operativo: Optional[str] = "Desconocido"
-    identificador_seguro: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()))
-    public_key: Optional[str] = None
+    identificador_seguro: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), max_length=255)
+    public_key: Optional[str] = Field(default=None, max_length=256)
+    vault_public_key: Optional[str] = Field(default=None, max_length=256)
+    # Kept only to accept older clients. The server never derives trust from it.
     confiar_dispositivo: bool = False
 
 
@@ -44,6 +46,7 @@ class DispositivoRead(BaseModel):
     identificador_seguro: str
     es_confiable: bool
     estado: str
+    huella_clave_publica: Optional[str] = None
     ultimo_acceso: datetime
 
 

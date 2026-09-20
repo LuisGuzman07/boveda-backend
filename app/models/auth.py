@@ -10,6 +10,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSON, UUID
@@ -107,6 +108,13 @@ class Usuario(Base):
 
 class Dispositivo(Base):
     __tablename__ = "dispositivo"
+    __table_args__ = (
+        UniqueConstraint(
+            "id_usuario",
+            "identificador_seguro",
+            name="uq_dispositivo_usuario_identificador",
+        ),
+    )
 
     id_dispositivo: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -119,8 +127,13 @@ class Dispositivo(Base):
     sistema_operativo: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     identificador_seguro: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     public_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    clave_firma_boveda: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    algoritmo_clave: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    huella_clave_publica: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     es_confiable: Mapped[bool] = mapped_column(Boolean, default=False)
-    estado: Mapped[str] = mapped_column(String(50), default="ACTIVO")
+    estado: Mapped[str] = mapped_column(String(50), default="PENDING")
+    identidad_verificada_en: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    confianza_otorgada_en: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     fecha_registro: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -134,6 +147,7 @@ class Dispositivo(Base):
 
     usuario: Mapped[Usuario] = relationship("Usuario", foreign_keys=[id_usuario], back_populates="dispositivos")
     sesiones: Mapped[List["Sesion"]] = relationship("Sesion", back_populates="dispositivo")
+    desafios: Mapped[List["DesafioDispositivo"]] = relationship("DesafioDispositivo", back_populates="dispositivo")
 
 
 class Sesion(Base):
@@ -149,6 +163,16 @@ class Sesion(Base):
         UUID(as_uuid=True), ForeignKey("dispositivo.id_dispositivo", ondelete="SET NULL"), nullable=True
     )
     refresh_token_hash: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    familia_refresh_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), index=True, nullable=False, default=uuid.uuid4
+    )
+    refresh_jti: Mapped[str] = mapped_column(
+        String(64), index=True, nullable=False, default=lambda: uuid.uuid4().hex
+    )
+    tipo_cliente: Mapped[str] = mapped_column(String(20), default="NATIVE", nullable=False)
+    csrf_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    refresh_consumido_en: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    mfa_verificado_en: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     revocada: Mapped[bool] = mapped_column(Boolean, default=False)
     motivo_revocacion: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     fecha_inicio: Mapped[datetime] = mapped_column(
@@ -161,6 +185,59 @@ class Sesion(Base):
 
     usuario: Mapped[Usuario] = relationship("Usuario", back_populates="sesiones")
     dispositivo: Mapped[Optional[Dispositivo]] = relationship("Dispositivo", back_populates="sesiones")
+    desafios: Mapped[List["DesafioDispositivo"]] = relationship("DesafioDispositivo", back_populates="sesion")
+    sesiones_boveda: Mapped[List["SesionBoveda"]] = relationship("SesionBoveda", back_populates="sesion")
+
+
+class DesafioDispositivo(Base):
+    __tablename__ = "desafio_dispositivo"
+
+    id_desafio: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id_usuario: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("usuario.id_usuario", ondelete="CASCADE"), nullable=False, index=True
+    )
+    id_dispositivo: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dispositivo.id_dispositivo", ondelete="CASCADE"), nullable=False, index=True
+    )
+    id_sesion: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sesion.id_sesion", ondelete="CASCADE"), nullable=False, index=True
+    )
+    proposito: Mapped[str] = mapped_column(String(50), nullable=False)
+    nonce_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    context_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    fecha_expiracion: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumido_en: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    intentos: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    fecha_creacion: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    dispositivo: Mapped[Dispositivo] = relationship("Dispositivo", back_populates="desafios")
+    sesion: Mapped[Sesion] = relationship("Sesion", back_populates="desafios")
+
+
+class SesionBoveda(Base):
+    __tablename__ = "sesion_boveda"
+
+    id_sesion_boveda: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id_usuario: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("usuario.id_usuario", ondelete="CASCADE"), nullable=False, index=True
+    )
+    id_dispositivo: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dispositivo.id_dispositivo", ondelete="CASCADE"), nullable=False, index=True
+    )
+    id_sesion: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sesion.id_sesion", ondelete="CASCADE"), nullable=False, index=True
+    )
+    id_desafio: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("desafio_dispositivo.id_desafio", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    jti: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    mfa_verificado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fecha_expiracion: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revocada: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    motivo_revocacion: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    fecha_creacion: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    sesion: Mapped[Sesion] = relationship("Sesion", back_populates="sesiones_boveda")
 
 
 class EventoAuditoria(Base):

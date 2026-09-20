@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 import hashlib
+import uuid
 import bcrypt
 import jwt
 from app.core.config import settings
@@ -29,11 +30,19 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def get_jwt_secret() -> str:
+    """Returns the validated JWT key without exposing it in configuration reprs."""
+    return settings.JWT_SECRET_KEY.get_secret_value()
+
+
 def create_access_token(
     subject: Union[str, Any],
     roles: Optional[List[str]] = None,
     permissions: Optional[List[str]] = None,
     expires_delta: Optional[timedelta] = None,
+    session_id: Optional[uuid.UUID] = None,
+    device_id: Optional[uuid.UUID] = None,
+    mfa_verified_at: Optional[datetime] = None,
 ) -> str:
     """Genera un JWT Access Token con los roles y permisos del usuario."""
     now = datetime.now(timezone.utc)
@@ -50,8 +59,14 @@ def create_access_token(
         "exp": expire,
         "type": "access",
     }
+    if session_id is not None:
+        to_encode["sid"] = str(session_id)
+    if device_id is not None:
+        to_encode["did"] = str(device_id)
+    if mfa_verified_at is not None:
+        to_encode["mfa_at"] = int(mfa_verified_at.timestamp())
     encoded_jwt = jwt.encode(
-        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
+        to_encode, get_jwt_secret(), algorithm=settings.JWT_ALGORITHM
     )
     return encoded_jwt
 
@@ -59,6 +74,10 @@ def create_access_token(
 def create_refresh_token(
     subject: Union[str, Any],
     expires_delta: Optional[timedelta] = None,
+    session_id: Optional[uuid.UUID] = None,
+    device_id: Optional[uuid.UUID] = None,
+    family_id: Optional[uuid.UUID] = None,
+    token_jti: Optional[uuid.UUID] = None,
 ) -> str:
     """Genera un JWT Refresh Token."""
     now = datetime.now(timezone.utc)
@@ -73,13 +92,25 @@ def create_refresh_token(
         "exp": expire,
         "type": "refresh",
     }
+    if session_id is not None:
+        to_encode["sid"] = str(session_id)
+    if device_id is not None:
+        to_encode["did"] = str(device_id)
+    if family_id is not None:
+        to_encode["fid"] = str(family_id)
+    if token_jti is not None:
+        to_encode["jti"] = str(token_jti)
     encoded_jwt = jwt.encode(
-        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
+        to_encode, get_jwt_secret(), algorithm=settings.JWT_ALGORITHM
     )
     return encoded_jwt
 
 
-def create_mfa_token(subject: Union[str, Any]) -> str:
+def create_mfa_token(
+    subject: Union[str, Any],
+    device_id: Optional[uuid.UUID] = None,
+    client_type: str = "NATIVE",
+) -> str:
     """Genera un JWT temporal de 5 minutos para el flujo de segundo factor MFA."""
     now = datetime.now(timezone.utc)
     expire = now + timedelta(minutes=5)
@@ -88,9 +119,12 @@ def create_mfa_token(subject: Union[str, Any]) -> str:
         "iat": now,
         "exp": expire,
         "type": "mfa_pending",
+        "client": client_type,
     }
+    if device_id is not None:
+        to_encode["did"] = str(device_id)
     encoded_jwt = jwt.encode(
-        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
+        to_encode, get_jwt_secret(), algorithm=settings.JWT_ALGORITHM
     )
     return encoded_jwt
 
@@ -100,7 +134,7 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
     try:
         payload = jwt.decode(
             token,
-            settings.JWT_SECRET_KEY,
+            get_jwt_secret(),
             algorithms=[settings.JWT_ALGORITHM],
         )
         return payload

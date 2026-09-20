@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, Header, Request
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.schemas.vault import VaultCreateRequest, VaultSessionRequest
-from app.services.auth_service import get_current_user
+from app.services.auth_service import AuthenticatedSession, get_current_auth_context
 from app.services.vault_security import get_vault_context, issue_vault_session
 from app.services.vault_service import VaultService
 
@@ -11,8 +11,13 @@ router = APIRouter(prefix="/vaults", tags=["CU-06: Bóvedas cifradas"])
 
 
 @router.post("/session")
-def create_vault_session(body: VaultSessionRequest, user=Depends(get_current_user), db: Session = Depends(get_db)):
-    return issue_vault_session(db, user, body)
+def create_vault_session(
+    body: VaultSessionRequest,
+    request: Request,
+    context: AuthenticatedSession = Depends(get_current_auth_context),
+    db: Session = Depends(get_db),
+):
+    return issue_vault_session(db, context, body, request)
 
 
 @router.post("", status_code=201)

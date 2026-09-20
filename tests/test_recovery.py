@@ -1,223 +1,244 @@
-from unittest.mock import patch
-import uuid
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
-from app.core.database import SessionLocal
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
+from app.api.routes.recovery import get_recovery_service
+from app.core.database import Base, get_db
+from app.core.security import get_password_hash, hash_token, verify_password
 from app.main import app
 from app.models.auth import EventoAuditoria, Sesion, Usuario
 from app.models.mfa import RecuperacionCuenta
-
-client = TestClient(app)
-
-TEST_USER_EMAIL = f"test_rec_{uuid.uuid4().hex[:8]}@boveda.com"
-TEST_USER_PASSWORD = "PasswordBase123!*"
+from app.services.recovery_service import RecoveryRateLimiter, RecoveryService
 
 
-@pytest.fixture(autouse=True)
-def mock_email_simulation_for_tests():
-    """Aisla las pruebas automáticas para usar el modo simulación y no saturar el servidor SMTP de Gmail."""
-    with patch("app.services.recovery_service.send_recovery_email", return_value=False):
-        yield
+class FakeRecoveryEmail:
+    def __init__(self, delivered: bool = True):
+        self.delivered = delivered
+        self.messages: list[dict[str, str | int]] = []
+
+    def __call__(self, to_email: str, reset_token: str, expires_in_minutes: int) -> bool:
+        if self.delivered:
+            self.messages.append(
+                {
+                    "to_email": to_email,
+                    "reset_token": reset_token,
+                    "expires_in_minutes": expires_in_minutes,
+                }
+            )
+        return self.delivered
 
 
-@pytest.fixture(scope="module", autouse=True)
-def setup_test_user():
-    """Crea un usuario dedicado para las pruebas de recuperación sin alterar cuentas existentes."""
-    reg_res = client.post(
-        "/api/v1/auth/register",
-        json={
-            "nombre": "Usuario Prueba Recuperacion",
-            "correo": TEST_USER_EMAIL,
-            "password": TEST_USER_PASSWORD,
-        },
+@pytest.fixture
+def recovery_environment():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
     )
-    assert reg_res.status_code == 201
-
-
-
-def test_forgot_password_success():
-    res = client.post(
-        "/api/v1/auth/recovery/forgot-password",
-        json={"correo": TEST_USER_EMAIL},
+    Base.metadata.create_all(engine)
+    db = Session(engine)
+    user = Usuario(
+        nombre="Usuario Recuperacion",
+        correo="recovery@example.com",
+        password_hash=get_password_hash("PasswordBase123!*"),
+        estado="ACTIVO",
     )
-    assert res.status_code == 200
-    data = res.json()
-    assert data["status"] == "ok"
-    assert data["simulation_token"] is not None
-    assert "token=" in data["simulation_reset_url"]
+    db.add(user)
+    db.commit()
 
-    # Verificar registro en base de datos
-    db = SessionLocal()
+    mailer = FakeRecoveryEmail()
+    limiter = RecoveryRateLimiter()
+    previous_overrides = dict(app.dependency_overrides)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_recovery_service] = lambda: RecoveryService(
+        db, email_sender=mailer, rate_limiter=limiter
+    )
+    client = TestClient(app)
+
     try:
-        user = db.scalars(select(Usuario).where(Usuario.correo == TEST_USER_EMAIL)).first()
-        assert user is not None
-
-        token_rec = db.scalars(
-            select(RecuperacionCuenta).where(
-                RecuperacionCuenta.id_usuario == user.id_usuario,
-                RecuperacionCuenta.tipo == "RESET_TOKEN",
-                RecuperacionCuenta.utilizado == False,
-            )
-        ).first()
-        assert token_rec is not None
-        assert token_rec.codigo.startswith("RST-")
-
-        # Verificar auditoría
-        audit = db.scalars(
-            select(EventoAuditoria).where(
-                EventoAuditoria.id_usuario == user.id_usuario,
-                EventoAuditoria.accion == "SOLICITUD_RECUPERACION",
-            )
-        ).first()
-        assert audit is not None
-        assert audit.resultado == "EXITO"
+        yield {
+            "client": client,
+            "db": db,
+            "user": user,
+            "mailer": mailer,
+            "limiter": limiter,
+        }
     finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous_overrides)
         db.close()
+        engine.dispose()
 
 
-def test_forgot_password_nonexistent_user():
-    fake_email = f"fantasma_{uuid.uuid4().hex[:8]}@boveda.com"
-    res = client.post(
-        "/api/v1/auth/recovery/forgot-password",
-        json={"correo": fake_email},
+def _request_recovery(environment, email="recovery@example.com"):
+    return environment["client"].post(
+        "/api/v1/auth/recovery/forgot-password", json={"correo": email}
     )
-    assert res.status_code == 200
-    data = res.json()
-    assert data["status"] == "ok"
-    # No debe generar token de simulación para correo inexistente
-    assert data.get("simulation_token") is None
-
-    # Verificar auditoría de intento fallido
-    db = SessionLocal()
-    try:
-        audit = db.scalars(
-            select(EventoAuditoria).where(
-                EventoAuditoria.accion == "SOLICITUD_RECUPERACION_FALLIDA",
-                EventoAuditoria.resultado == "FALLO",
-            )
-        ).first()
-        assert audit is not None
-    finally:
-        db.close()
 
 
-def test_validate_token():
-    # 1. Generar token
-    res = client.post(
-        "/api/v1/auth/recovery/forgot-password",
-        json={"correo": TEST_USER_EMAIL},
+def _captured_token(environment) -> str:
+    return environment["mailer"].messages[-1]["reset_token"]
+
+
+def test_forgot_password_is_generic_and_never_returns_a_token(recovery_environment):
+    existing = _request_recovery(recovery_environment)
+    missing = _request_recovery(recovery_environment, "missing@example.com")
+
+    assert existing.status_code == missing.status_code == 200
+    assert existing.json() == missing.json()
+    assert set(existing.json()) == {"status", "message"}
+    assert len(recovery_environment["mailer"].messages) == 1
+
+    raw_token = _captured_token(recovery_environment)
+    record = recovery_environment["db"].scalar(
+        select(RecuperacionCuenta).where(RecuperacionCuenta.tipo == "RESET_TOKEN")
     )
-    token = res.json()["simulation_token"]
+    assert record is not None
+    assert record.token_hash == hash_token(raw_token)
+    assert raw_token not in record.codigo
+    assert raw_token not in str(existing.json())
 
-    # 2. Validar token correcto
-    val_res = client.get(f"/api/v1/auth/recovery/validate-token?token={token}")
-    assert val_res.status_code == 200
-    assert val_res.json()["valid"] is True
-    assert val_res.json()["correo"] == TEST_USER_EMAIL
-
-    # 3. Validar token incorrecto
-    fake_token = "token_totalmente_invalido_1234567890"
-    inv_res = client.get(f"/api/v1/auth/recovery/validate-token?token={fake_token}")
-    assert inv_res.status_code == 200
-    assert inv_res.json()["valid"] is False
+    audit_details = recovery_environment["db"].scalars(select(EventoAuditoria)).all()
+    assert all(raw_token not in str(event.detalles) for event in audit_details)
 
 
-def test_reset_password_weak_password():
-    res = client.post(
-        "/api/v1/auth/recovery/forgot-password",
-        json={"correo": TEST_USER_EMAIL},
+def test_smtp_unavailable_invalidates_the_generated_token_without_http_exposure(
+    recovery_environment,
+):
+    recovery_environment["mailer"].delivered = False
+
+    response = _request_recovery(recovery_environment)
+
+    assert response.status_code == 200
+    assert set(response.json()) == {"status", "message"}
+    assert recovery_environment["mailer"].messages == []
+    record = recovery_environment["db"].scalar(
+        select(RecuperacionCuenta).where(RecuperacionCuenta.tipo == "RESET_TOKEN")
     )
-    token = res.json()["simulation_token"]
-
-    bad_payload = {
-        "token": token,
-        "password": "debil",  # No cumple requisitos
-    }
-    reset_res = client.post("/api/v1/auth/recovery/reset-password", json=bad_payload)
-    assert reset_res.status_code == 422
+    assert record is not None
+    assert record.utilizado is True
 
 
-def test_reset_password_same_as_old():
-    res = client.post(
-        "/api/v1/auth/recovery/forgot-password",
-        json={"correo": TEST_USER_EMAIL},
+def test_validate_token_uses_post_and_does_not_disclose_email(recovery_environment):
+    _request_recovery(recovery_environment)
+    token = _captured_token(recovery_environment)
+
+    valid = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/validate-token", json={"token": token}
     )
-    token = res.json()["simulation_token"]
-
-    same_payload = {
-        "token": token,
-        "password": TEST_USER_PASSWORD,  # Misma contraseña actual
-    }
-    reset_res = client.post("/api/v1/auth/recovery/reset-password", json=same_payload)
-    assert reset_res.status_code == 400
-    assert "no puede ser idéntica" in reset_res.json()["detail"]
-
-
-def test_reset_password_full_lifecycle_and_session_revocation():
-    # 1. Iniciar sesión para tener una sesión activa
-    login_res = client.post(
-        "/api/v1/auth/login",
-        json={
-            "correo": TEST_USER_EMAIL,
-            "password": TEST_USER_PASSWORD,
-            "dispositivo": {
-                "nombre": "Laptop de Prueba",
-                "tipo": "DESKTOP",
-                "identificador_seguro": "test-device-recovery-lifecycle",
-            },
-        },
+    invalid = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/validate-token", json={"token": "invalid-token-1234567890"}
     )
-    assert login_res.status_code == 200
 
-    # 2. Solicitar restablecimiento
-    forgot_res = client.post(
-        "/api/v1/auth/recovery/forgot-password",
-        json={"correo": TEST_USER_EMAIL},
+    assert valid.status_code == invalid.status_code == 200
+    assert valid.json()["valid"] is True
+    assert invalid.json()["valid"] is False
+    assert "correo" not in valid.json()
+
+
+def test_expired_token_is_rejected(recovery_environment):
+    _request_recovery(recovery_environment)
+    token = _captured_token(recovery_environment)
+    record = recovery_environment["db"].scalar(
+        select(RecuperacionCuenta).where(RecuperacionCuenta.tipo == "RESET_TOKEN")
     )
-    token = forgot_res.json()["simulation_token"]
+    record.fecha_expiracion = datetime.now(timezone.utc) - timedelta(minutes=1)
+    recovery_environment["db"].commit()
 
-    # 3. Restablecer con nueva contraseña
-    new_password = "NuevaPasswordSegura2026!#"
-    reset_res = client.post(
+    validation = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/validate-token", json={"token": token}
+    )
+    reset = recovery_environment["client"].post(
         "/api/v1/auth/recovery/reset-password",
-        json={
-            "token": token,
-            "password": new_password,
-        },
+        json={"token": token, "password": "NuevaPassword123!*"},
     )
-    assert reset_res.status_code == 200
-    data = reset_res.json()
-    assert data["status"] == "ok"
-    assert data["sesiones_revocadas"] >= 1
-    assert "Cero Conocimiento" in data["zero_knowledge_notice"]
 
-    # 4. Probar login con contraseña antigua -> debe fallar (401)
-    old_login = client.post(
-        "/api/v1/auth/login",
-        json={
-            "correo": TEST_USER_EMAIL,
-            "password": TEST_USER_PASSWORD,
-        },
-    )
-    assert old_login.status_code == 401
+    assert validation.json()["valid"] is False
+    assert reset.status_code == 400
 
-    # 5. Probar login con nueva contraseña -> debe ser exitoso (200)
-    new_login = client.post(
-        "/api/v1/auth/login",
-        json={
-            "correo": TEST_USER_EMAIL,
-            "password": new_password,
-        },
-    )
-    assert new_login.status_code == 200
 
-    # 6. Intentar reutilizar el token -> debe fallar (400)
-    reuse_res = client.post(
-        "/api/v1/auth/recovery/reset-password",
-        json={
-            "token": token,
-            "password": "OtraPassword2026!#",
-        },
+def test_reset_consumes_token_revokes_sessions_and_changes_password(recovery_environment):
+    _request_recovery(recovery_environment)
+    token = _captured_token(recovery_environment)
+    session = Sesion(
+        id_usuario=recovery_environment["user"].id_usuario,
+        refresh_token_hash="test-session-hash",
+        fecha_expiracion=datetime.now(timezone.utc) + timedelta(days=1),
+        revocada=False,
     )
-    assert reuse_res.status_code == 400
+    recovery_environment["db"].add(session)
+    recovery_environment["db"].commit()
+
+    payload = {"token": token, "password": "NuevaPassword123!*"}
+    reset = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/reset-password", json=payload
+    )
+    reused = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/reset-password", json=payload
+    )
+
+    recovery_environment["db"].expire_all()
+    user = recovery_environment["db"].get(Usuario, recovery_environment["user"].id_usuario)
+    token_record = recovery_environment["db"].scalar(
+        select(RecuperacionCuenta).where(RecuperacionCuenta.token_hash == hash_token(token))
+    )
+    updated_session = recovery_environment["db"].get(Sesion, session.id_sesion)
+
+    assert reset.status_code == 200
+    assert reset.json()["sesiones_revocadas"] == 1
+    assert verify_password("NuevaPassword123!*", user.password_hash)
+    assert token_record.utilizado is True
+    assert updated_session.revocada is True
+    assert reused.status_code == 400
+
+
+def test_new_request_invalidates_the_previous_token(recovery_environment):
+    _request_recovery(recovery_environment)
+    first_token = _captured_token(recovery_environment)
+    _request_recovery(recovery_environment)
+    second_token = _captured_token(recovery_environment)
+
+    first_validation = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/validate-token", json={"token": first_token}
+    )
+    second_validation = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/validate-token", json={"token": second_token}
+    )
+
+    assert first_validation.json()["valid"] is False
+    assert second_validation.json()["valid"] is True
+
+
+def test_rate_limit_stops_repeated_delivery_without_changing_the_response(
+    recovery_environment,
+):
+    recovery_environment["limiter"].max_attempts = 1
+
+    first = _request_recovery(recovery_environment)
+    second = _request_recovery(recovery_environment)
+
+    assert first.json() == second.json()
+    assert len(recovery_environment["mailer"].messages) == 1
+
+
+def test_rate_limit_does_not_trust_spoofed_forwarded_for(recovery_environment):
+    recovery_environment["limiter"].max_attempts = 1
+    client = recovery_environment["client"]
+
+    first = client.post(
+        "/api/v1/auth/recovery/forgot-password",
+        json={"correo": "recovery@example.com"},
+        headers={"X-Forwarded-For": "198.51.100.10"},
+    )
+    second = client.post(
+        "/api/v1/auth/recovery/forgot-password",
+        json={"correo": "recovery@example.com"},
+        headers={"X-Forwarded-For": "203.0.113.20"},
+    )
+
+    assert first.json() == second.json()
+    assert len(recovery_environment["mailer"].messages) == 1

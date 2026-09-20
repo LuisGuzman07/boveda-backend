@@ -17,7 +17,10 @@ class AutenticadorMfa(Base):
         UUID(as_uuid=True), ForeignKey("usuario.id_usuario", ondelete="CASCADE"), nullable=False
     )
     tipo: Mapped[str] = mapped_column(String(50), default="TOTP", nullable=False)
-    secreto_cifrado: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Retained only for legacy rows until the controlled encryption backfill is verified.
+    secreto_cifrado: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    secreto_cifrado_v2: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    version_criptografica: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     public_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     credential_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     contador: Mapped[int] = mapped_column(Integer, default=0)

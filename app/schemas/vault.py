@@ -61,6 +61,6 @@ class VaultCreateRequest(VaultSchema):
 
 
 class VaultSessionRequest(VaultSchema):
-    refresh_token: str = Field(min_length=20, max_length=4096)
-    code: str = Field(pattern=r"^\d{6}$")
-    public_key: str = Field(max_length=64)
+    id_desafio: uuid.UUID
+    nonce: str = Field(min_length=32, max_length=512)
+    firma: str = Field(min_length=32, max_length=256)
