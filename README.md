@@ -55,6 +55,11 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 Store the result only in the local environment or `.env` file. Do not use the `.env.example` placeholder, log it, or commit it.
 
+S3 replication is optional. Keep `S3_ENABLED=false` for the local MinIO-only stack. When enabled, configure `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, and `S3_SECURE` only through the environment. The API copies and verifies ciphertext bytes; it never decrypts or sends plaintext to either provider.
+
+CU-13 replication is triggered with the existing signed vault session:
+`POST /api/v1/vaults/{vault_id}/files/{version_id}/replicate`. CU-10 download prefers a verified MinIO replica and falls back to a verified S3 replica after checking the stored SHA-256 and byte size. CU-15 consistency reporting and CU-20 Emergency Kit are intentionally out of scope.
+
 > ⚠️ **IMPORTANTE:** El archivo `.env` nunca debe subirse al repositorio de Git.
 
 El refresh web se entrega mediante cookies `HttpOnly` y requiere una cookie/encabezado

@@ -17,6 +17,23 @@ services:
       timeout: 5s
       retries: 5
 
+  minio:
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-boveda-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-boveda-minio-development}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   backend:
     build:
       context: .
@@ -31,10 +48,19 @@ services:
       - .env
     environment:
       - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-boveda_user}:${POSTGRES_PASSWORD:-boveda_password}@db:5432/${POSTGRES_DB:-boveda_db}
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-boveda-minio}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-boveda-minio-development}
+      - MINIO_BUCKET=${MINIO_BUCKET:-boveda-cifrada}
+      - MINIO_SECURE=false
     depends_on:
       db:
+        condition: service_healthy
+      minio:
         condition: service_healthy
 
 volumes:
   postgres_data:
     name: boveda_postgres_data
+  minio_data:
+    name: boveda_minio_data

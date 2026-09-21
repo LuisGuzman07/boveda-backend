@@ -263,6 +263,10 @@ class EventoAuditoria(Base):
     fecha_evento: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    chain_sequence: Mapped[Optional[int]] = mapped_column(Integer, unique=True, index=True, nullable=True)
+    previous_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    event_hash: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
     usuario: Mapped[Optional[Usuario]] = relationship("Usuario", foreign_keys=[id_usuario], lazy="joined")
     dispositivo: Mapped[Optional[Dispositivo]] = relationship("Dispositivo", foreign_keys=[id_dispositivo], lazy="joined")

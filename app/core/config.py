@@ -41,6 +41,20 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "postgresql+psycopg://boveda_user:boveda_password@db:5432/boveda_db"
 
+    MINIO_ENDPOINT: str = "minio:9000"
+    MINIO_ACCESS_KEY: str = "boveda-minio"
+    MINIO_SECRET_KEY: SecretStr = SecretStr("boveda-minio-development")
+    MINIO_BUCKET: str = "boveda-cifrada"
+    MINIO_SECURE: bool = False
+
+    S3_ENABLED: bool = False
+    S3_ENDPOINT: str = ""
+    S3_REGION: str = "us-east-1"
+    S3_BUCKET: str = "boveda-cifrada-replica"
+    S3_ACCESS_KEY: SecretStr = SecretStr("")
+    S3_SECRET_KEY: SecretStr = SecretStr("")
+    S3_SECURE: bool = True
+
     # JWT & Authentication
     JWT_SECRET_KEY: SecretStr
     JWT_ALGORITHM: Literal["HS256"] = "HS256"

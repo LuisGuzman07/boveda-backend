@@ -36,6 +36,10 @@ class EventoAuditoriaRead(BaseModel):
     user_agent: Optional[str] = None
     detalles: Optional[Dict[str, Any]] = None
     fecha_evento: datetime
+    chain_sequence: int
+    previous_hash: str
+    event_hash: str
+    schema_version: int
     usuario: Optional[UsuarioAuditBrief] = None
     dispositivo: Optional[DispositivoAuditBrief] = None
 

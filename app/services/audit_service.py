@@ -1,6 +1,4 @@
-import csv
 from datetime import datetime, timezone
-import io
 import math
 from typing import Any, Dict, List, Optional
 import uuid
@@ -76,6 +74,10 @@ class AuditService:
                     user_agent=ev.user_agent,
                     detalles=ev.detalles,
                     fecha_evento=ev.fecha_evento,
+                    chain_sequence=ev.chain_sequence,
+                    previous_hash=ev.previous_hash,
+                    event_hash=ev.event_hash,
+                    schema_version=ev.schema_version,
                     usuario=u_brief,
                     dispositivo=d_brief,
                 )
@@ -101,67 +103,6 @@ class AuditService:
             por_tipo=stats["por_tipo"],
             por_accion=stats["por_accion"],
         )
-
-    def export_csv(
-        self,
-        fecha_inicio: Optional[datetime] = None,
-        fecha_fin: Optional[datetime] = None,
-        tipo_evento: Optional[str] = None,
-        resultado: Optional[str] = None,
-        query: Optional[str] = None,
-    ) -> str:
-        """Exporta los eventos de la bitácora a un string en formato CSV."""
-        events = self.repo.get_all_for_export(
-            fecha_inicio=fecha_inicio,
-            fecha_fin=fecha_fin,
-            tipo_evento=tipo_evento,
-            resultado=resultado,
-            query=query,
-        )
-
-        output = io.StringIO()
-        writer = csv.writer(output, delimiter=";", quoting=csv.QUOTE_MINIMAL)
-
-        # Encabezados
-        writer.writerow([
-            "ID Evento",
-            "Fecha y Hora (UTC)",
-            "Usuario",
-            "Correo",
-            "Acción",
-            "Categoría / Tipo",
-            "Resultado",
-            "Recurso Tipo",
-            "Recurso ID",
-            "Dirección IP",
-            "Dispositivo",
-            "User Agent",
-            "Detalles (JSON)",
-        ])
-
-        for ev in events:
-            user_name = ev.usuario.nombre if ev.usuario else "Sistema / Anónimo"
-            user_email = ev.usuario.correo if ev.usuario else "-"
-            dev_name = ev.dispositivo.nombre if ev.dispositivo else "-"
-
-            writer.writerow([
-                str(ev.id_evento),
-                ev.fecha_evento.isoformat(),
-                user_name,
-                user_email,
-                ev.accion,
-                ev.tipo_evento,
-                ev.resultado,
-                ev.recurso_tipo or "-",
-                ev.recurso_id or "-",
-                ev.direccion_ip or "-",
-                dev_name,
-                ev.user_agent or "-",
-                str(ev.detalles or {}),
-            ])
-
-        return output.getvalue()
-
 
 def log_audit_event(
     db: Session,

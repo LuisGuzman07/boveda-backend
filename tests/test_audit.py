@@ -68,17 +68,12 @@ def test_get_audit_stats():
     assert "por_accion" in data
 
 
-def test_export_audit_csv():
+def test_raw_audit_export_is_retired():
     admin_token = get_user_token("admin@boveda.com")
 
     response = client.get(
         "/api/v1/audit/export",
         headers={"Authorization": f"Bearer {admin_token}"},
     )
-    assert response.status_code == 200
-    assert "text/csv" in response.headers["content-type"]
-    assert "attachment; filename=" in response.headers["content-disposition"]
-    csv_text = response.text
-    assert "ID Evento" in csv_text
-    assert "Fecha y Hora" in csv_text
-    assert "Acción" in csv_text
+    assert response.status_code == 410
+    assert "reportes agregados seguros" in response.json()["detail"]

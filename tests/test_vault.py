@@ -109,7 +109,10 @@ def _vault_session(identity):
         },
     )
     assert response.status_code == 200, response.text
-    return response.json(), access_token, device, vault_signing_key
+    session = response.json()
+    assert "vault_key" not in session
+    assert "clave" not in session
+    return session, access_token, device, vault_signing_key
 
 
 def _envelope(length=32):
@@ -152,7 +155,7 @@ def _signed_request(signing_key, vault_token, method, path, body=None, retry_key
             payload["jti"],
             timestamp,
             method,
-            path,
+            path.split("?")[0],
             retry_key,
             hashlib.sha256(text.encode("utf-8")).hexdigest(),
         ]

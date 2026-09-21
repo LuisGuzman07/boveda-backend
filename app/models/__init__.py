@@ -12,8 +12,10 @@ from app.models.auth import (
     EventoAuditoria,
 )
 from app.models.mfa import AutenticadorMfa, RecuperacionCuenta
-from app.models.vault import Boveda, MembresiaBoveda, ClaveEnvuelta
+from app.models.vault import AccesoCompartido, Archivo, Boveda, ClaveEnvuelta, KitEmergencia, MembresiaBoveda, ReplicaAlmacenamiento, SobreAccesoCompartido, VersionArchivo
 from app.models.policy import PoliticaSeguridad
+from app.models.anomaly import AnalisisAnomalia, HallazgoAnomalia
+from app.models.compliance_report import ReporteCumplimiento
 
 __all__ = [
     "Usuario",
@@ -29,5 +31,14 @@ __all__ = [
     "Boveda",
     "MembresiaBoveda",
     "ClaveEnvuelta",
+    "KitEmergencia",
+    "Archivo",
+    "VersionArchivo",
+    "ReplicaAlmacenamiento",
+    "AccesoCompartido",
+    "SobreAccesoCompartido",
     "PoliticaSeguridad",
+    "AnalisisAnomalia",
+    "HallazgoAnomalia",
+    "ReporteCumplimiento",
 ]

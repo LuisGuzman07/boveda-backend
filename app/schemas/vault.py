@@ -64,3 +64,47 @@ class VaultSessionRequest(VaultSchema):
     id_desafio: uuid.UUID
     nonce: str = Field(min_length=32, max_length=512)
     firma: str = Field(min_length=32, max_length=256)
+
+
+class EmergencyKitCreateRequest(VaultSchema):
+    id_boveda: uuid.UUID
+    id_kit: uuid.UUID
+    version_kit: Literal[1] = 1
+    version_criptografica: Literal[1] = 1
+    kdf_salt: str = Field(max_length=64)
+    kdf_salt_boveda: str = Field(max_length=64)
+    kdf_parametros: KdfParameters
+    sobre_cifrado: EncryptedEnvelope
+    huella_kit: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expira_en_dias: int = Field(default=365, ge=1, le=3650)
+
+    @field_validator("kdf_salt")
+    @classmethod
+    def validate_kit_salt(cls, value):
+        try:
+            if len(base64.b64decode(value, validate=True)) != 16:
+                raise ValueError("La sal debe tener 16 bytes")
+        except Exception as error:
+            raise ValueError("Sal Argon2id inválida") from error
+        return value
+
+
+class EmergencyKitRecoverRequest(VaultSchema):
+    id_kit: uuid.UUID
+    id_dispositivo: uuid.UUID
+    clave_envuelta: WrappedVaultKey
+
+
+class EmergencyKitRead(VaultSchema):
+    id_kit: uuid.UUID
+    id_boveda: uuid.UUID
+    version_kit: int
+    version_criptografica: int
+    algoritmo_kdf: Literal["Argon2id"]
+    kdf_salt: str
+    kdf_salt_boveda: str
+    kdf_parametros: KdfParameters
+    sobre_cifrado: EncryptedEnvelope
+    huella_kit: str
+    estado: Literal["ACTIVO", "REVOCADO"]
+    fecha_expiracion: Optional[str] = None

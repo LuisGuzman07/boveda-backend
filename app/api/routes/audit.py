@@ -1,12 +1,17 @@
 from datetime import datetime
+import uuid
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.auth import Usuario
 from app.schemas.audit import AuditListResponse, AuditStatsResponse
+from app.schemas.compliance_report import ComplianceReportCreate, ComplianceReportRead
+from app.schemas.anomaly import AnomalyRunRead, ChainVerificationRead
 from app.services.auth_service import get_current_user
 from app.services.audit_service import AuditService
+from app.services.anomaly_service import AnomalyService
+from app.services.compliance_report_service import ComplianceReportService
 
 router = APIRouter(prefix="/audit", tags=["CU-21: Bitácora de Auditoría"])
 
@@ -21,6 +26,14 @@ def verify_audit_permission(current_user: Usuario = Depends(get_current_user)) -
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No tienes los privilegios necesarios (audit:read) para consultar la bitácora de auditoría.",
         )
+    return current_user
+
+
+def verify_audit_export_permission(current_user: Usuario = Depends(get_current_user)) -> Usuario:
+    """Exports are a separate privilege; audit:read never grants report download."""
+    user_perms = {p.codigo for role in current_user.roles for p in role.permisos}
+    if "audit:export" not in user_perms:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tienes el permiso audit:export para generar o descargar reportes.")
     return current_user
 
 
@@ -67,35 +80,74 @@ def get_audit_stats(
     return service.get_stats()
 
 
-@router.get(
-    "/export",
-    summary="CU-21 / CU-23: Exportar bitácora a formato CSV",
-    description="Descarga el historial de eventos de auditoría filtrado en formato CSV estándar para reportes y conformidad.",
-)
-def export_audit_csv(
-    fecha_inicio: Optional[datetime] = Query(None),
-    fecha_fin: Optional[datetime] = Query(None),
-    tipo_evento: Optional[str] = Query(None),
-    resultado: Optional[str] = Query(None),
-    query: Optional[str] = Query(None),
-    current_user: Usuario = Depends(verify_audit_permission),
+@router.get("/integrity", response_model=ChainVerificationRead, summary="Verificar integridad de la cadena de auditoría")
+def verify_audit_chain(current_user: Usuario = Depends(verify_audit_permission), db: Session = Depends(get_db)):
+    return AnomalyService(db).verify_chain()
+
+
+@router.post("/anomalies/runs", response_model=AnomalyRunRead, status_code=status.HTTP_201_CREATED, summary="Ejecutar análisis local de anomalías")
+def create_anomaly_run(current_user: Usuario = Depends(verify_audit_permission), db: Session = Depends(get_db)):
+    return AnomalyService(db).create_run(current_user.id_usuario)
+
+
+@router.get("/anomalies/runs", response_model=list[AnomalyRunRead], summary="Listar análisis locales de anomalías")
+def list_anomaly_runs(current_user: Usuario = Depends(verify_audit_permission), db: Session = Depends(get_db)):
+    return AnomalyService(db).list_runs()
+
+
+@router.get("/anomalies/runs/{run_id}", response_model=AnomalyRunRead, summary="Consultar análisis local de anomalías")
+def get_anomaly_run(run_id: str, current_user: Usuario = Depends(verify_audit_permission), db: Session = Depends(get_db)):
+    try:
+        return AnomalyService(db).get_run(run_id)
+    except LookupError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Análisis no encontrado.")
+
+
+@router.post("/reports", response_model=ComplianceReportRead, status_code=status.HTTP_201_CREATED, summary="Generar reporte seguro de cumplimiento")
+def generate_compliance_report(
+    body: ComplianceReportCreate,
+    current_user: Usuario = Depends(verify_audit_export_permission),
     db: Session = Depends(get_db),
 ):
-    service = AuditService(db)
-    csv_content = service.export_csv(
-        fecha_inicio=fecha_inicio,
-        fecha_fin=fecha_fin,
-        tipo_evento=tipo_evento,
-        resultado=resultado,
-        query=query,
-    )
+    try:
+        return ComplianceReportService(db).generate(body, current_user.id_usuario)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
-    filename = f"bitacora_auditoria_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+@router.get("/reports", response_model=list[ComplianceReportRead], summary="Listar reportes seguros de cumplimiento")
+def list_compliance_reports(
+    current_user: Usuario = Depends(verify_audit_export_permission),
+    db: Session = Depends(get_db),
+):
+    return ComplianceReportService(db).list_reports()
+
+
+@router.get("/reports/{report_id}/download", summary="Descargar reporte seguro de cumplimiento")
+def download_compliance_report(
+    report_id: str,
+    formato: str = Query("json", pattern="^(json|csv)$"),
+    current_user: Usuario = Depends(verify_audit_export_permission),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = ComplianceReportService(db)
+        report = service.get_report(uuid.UUID(report_id))
+    except (LookupError, ValueError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reporte no encontrado.")
+    content, media_type = service.serialize(report, formato)
+    service.audit_download(report, current_user.id_usuario, formato)
     return Response(
-        content=csv_content,
-        media_type="text/csv",
+        content=content,
+        media_type=media_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": f'attachment; filename="reporte_cumplimiento_{report.id_reporte}.{formato}"',
             "Access-Control-Expose-Headers": "Content-Disposition",
         },
     )
+
+
+@router.get("/export", status_code=status.HTTP_410_GONE, summary="Exportación cruda retirada")
+def retired_raw_audit_export():
+    """The former event-level CSV export could expose sensitive audit fields."""
+    raise HTTPException(status_code=status.HTTP_410_GONE, detail="La exportación cruda fue retirada. Use /audit/reports para reportes agregados seguros.")

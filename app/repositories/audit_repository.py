@@ -50,48 +50,13 @@ class AuditRepository:
         count_stmt = select(func.count()).select_from(stmt.subquery())
         total = self.db.scalar(count_stmt) or 0
 
-        # Pagination & sorting (most recent first)
-        stmt = stmt.order_by(desc(EventoAuditoria.fecha_evento))
+        # Chain order is stable even when several events share a timestamp.
+        stmt = stmt.order_by(desc(EventoAuditoria.chain_sequence), desc(EventoAuditoria.fecha_evento))
         offset = (page - 1) * page_size
         stmt = stmt.offset(offset).limit(page_size)
 
         items = list(self.db.scalars(stmt).all())
         return items, total
-
-    def get_all_for_export(
-        self,
-        fecha_inicio: Optional[datetime] = None,
-        fecha_fin: Optional[datetime] = None,
-        tipo_evento: Optional[str] = None,
-        resultado: Optional[str] = None,
-        query: Optional[str] = None,
-        limit: int = 2000,
-    ) -> List[EventoAuditoria]:
-        """Obtiene los eventos para exportación (hasta un límite de seguridad)."""
-        stmt = select(EventoAuditoria).join(Usuario, EventoAuditoria.id_usuario == Usuario.id_usuario, isouter=True)
-
-        if fecha_inicio:
-            stmt = stmt.where(EventoAuditoria.fecha_evento >= fecha_inicio)
-        if fecha_fin:
-            stmt = stmt.where(EventoAuditoria.fecha_evento <= fecha_fin)
-        if tipo_evento:
-            stmt = stmt.where(EventoAuditoria.tipo_evento == tipo_evento.strip())
-        if resultado:
-            stmt = stmt.where(EventoAuditoria.resultado == resultado.strip().upper())
-        if query:
-            q = f"%{query.strip()}%"
-            stmt = stmt.where(
-                or_(
-                    EventoAuditoria.accion.ilike(q),
-                    EventoAuditoria.recurso_tipo.ilike(q),
-                    EventoAuditoria.direccion_ip.ilike(q),
-                    Usuario.nombre.ilike(q),
-                    Usuario.correo.ilike(q),
-                )
-            )
-
-        stmt = stmt.order_by(desc(EventoAuditoria.fecha_evento)).limit(limit)
-        return list(self.db.scalars(stmt).all())
 
     def get_stats(self) -> Dict[str, Any]:
         """Calcula métricas agregadas de eventos de auditoría."""
