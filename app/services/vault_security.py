@@ -19,6 +19,7 @@ from app.repositories.mfa_repository import MfaRepository
 from app.schemas.vault import VaultSessionRequest
 from app.services.auth_service import AuthenticatedSession, get_current_auth_context
 from app.services.device_identity_service import CHALLENGE_VAULT, DeviceIdentityService
+from app.services.policy_service import PolicyService
 
 
 vault_bearer = HTTPBearer(auto_error=False)
@@ -113,7 +114,10 @@ def issue_vault_session(
         lock=True,
     )
     now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(minutes=settings.VAULT_SESSION_EXPIRE_MINUTES)
+    duration_minutes = PolicyService(db).get_effective_value(
+        "VAULT_SESSION_DURATION_MINUTES"
+    )
+    expires_at = now + timedelta(minutes=duration_minutes)
     vault_session = SesionBoveda(
         id_sesion_boveda=uuid.uuid4(),
         id_usuario=user.id_usuario,
@@ -148,13 +152,13 @@ def issue_vault_session(
         device_id=device.id_dispositivo,
         ip=request.client.host if request.client else None,
         user_agent=request.headers.get("User-Agent", "Desconocido"),
-        detalles={"expira_en_minutos": settings.VAULT_SESSION_EXPIRE_MINUTES},
+        detalles={"expira_en_minutos": duration_minutes},
     )
     return {
         "access_token": token,
         "id_dispositivo": str(device.id_dispositivo),
         "id_usuario": str(user.id_usuario),
-        "expires_in": settings.VAULT_SESSION_EXPIRE_MINUTES * 60,
+        "expires_in": duration_minutes * 60,
     }
 
 
@@ -210,6 +214,39 @@ async def get_vault_context(
         or vault_session.jti != payload["jti"]
     ):
         reject(401, "Sesión de bóveda expirada o revocada.")
+
+    duration_minutes = PolicyService(db).get_effective_value(
+        "VAULT_SESSION_DURATION_MINUTES"
+    )
+    policy_expiration = _as_utc(vault_session.fecha_creacion) + timedelta(
+        minutes=duration_minutes
+    )
+    if policy_expiration <= now:
+        revoked = db.execute(
+            update(SesionBoveda)
+            .where(
+                SesionBoveda.id_sesion_boveda == vault_session.id_sesion_boveda,
+                SesionBoveda.revocada.is_(False),
+            )
+            .values(revocada=True, motivo_revocacion="EXPIRACION_POLITICA_BOVEDA")
+        )
+        if revoked.rowcount:
+            AuthRepository(db).add_audit_event(
+                accion="SESION_BOVEDA_EXPIRADA_POLITICA",
+                tipo_evento="SEGURIDAD",
+                resultado="EXITO",
+                user_id=user.id_usuario,
+                device_id=device.id_dispositivo,
+                ip=request.client.host if request.client else None,
+                user_agent=request.headers.get("User-Agent", "Desconocido"),
+                detalles={"duracion_minutos": duration_minutes},
+            )
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        reject(401, "Sesión de bóveda expirada por la política de seguridad vigente.")
 
     try:
         verify_ed25519_signature(

@@ -21,6 +21,7 @@ from app.services.auth_service import (
     AuthenticatedSession,
     IssuedSession,
     get_current_auth_context,
+    get_current_auth_context_for_inactivity_lock,
     get_current_user,
 )
 from app.services.mfa_service import MfaService
@@ -120,7 +121,12 @@ def refresh_web(
     if not refresh_token:
         _clear_web_session_cookies(response)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión expirada o revocada.")
-    issued = AuthService(db).refresh_web(refresh_token, csrf_token)
+    issued = AuthService(db).refresh_web(
+        refresh_token,
+        csrf_token,
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
+    )
     _set_web_session_cookies(response, issued)
     return issued.response
 
@@ -153,6 +159,26 @@ def logout_web(
     AuthService(db).logout_web(refresh_token, csrf_token)
     _clear_web_session_cookies(response)
     return LogoutResponse()
+
+
+@router.post("/web/inactivity-lock", status_code=status.HTTP_204_NO_CONTENT)
+def lock_web_session_for_inactivity(
+    request: Request,
+    response: Response,
+    csrf_token: Optional[str] = Header(None, alias="X-CSRF-Token"),
+    _: None = Depends(require_allowed_web_origin),
+    context: AuthenticatedSession = Depends(get_current_auth_context_for_inactivity_lock),
+    db: Session = Depends(get_db),
+):
+    AuthService(db).lock_web_session_for_inactivity(
+        context,
+        csrf_token,
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "Desconocido"),
+    )
+    _clear_web_session_cookies(response)
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
 
 
 @router.post("/web/mfa/verify-login", response_model=LoginResponse)

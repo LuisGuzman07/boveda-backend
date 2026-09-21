@@ -10,10 +10,12 @@ from sqlalchemy.pool import StaticPool
 
 from app.api.routes.recovery import get_recovery_service
 from app.core.database import Base, get_db
+from app.core.seed import seed_security_policies
 from app.core.security import get_password_hash, hash_token, verify_password
 from app.main import app
 from app.models.auth import DesafioDispositivo, Dispositivo, EventoAuditoria, Sesion, SesionBoveda, Usuario
 from app.models.mfa import AutenticadorMfa, RecuperacionCuenta
+from app.models.policy import PoliticaSeguridad
 from app.services.recovery_service import RecoveryRateLimiter, RecoveryService
 from app.services.totp_secret_service import store_encrypted_totp_secret
 
@@ -51,6 +53,7 @@ def recovery_environment():
         estado="ACTIVO",
     )
     db.add(user)
+    seed_security_policies(db)
     db.commit()
 
     mailer = FakeRecoveryEmail()
@@ -197,6 +200,29 @@ def test_reset_consumes_token_revokes_sessions_and_changes_password(recovery_env
     assert token_record.utilizado is True
     assert updated_session.revocada is True
     assert reused.status_code == 400
+
+
+def test_reset_rejects_a_password_below_the_current_policy_minimum(recovery_environment):
+    _request_recovery(recovery_environment)
+    token = _captured_token(recovery_environment)
+    policy = recovery_environment["db"].scalar(
+        select(PoliticaSeguridad).where(PoliticaSeguridad.codigo == "PASSWORD_MIN_LENGTH")
+    )
+    assert policy is not None
+    policy.valor_entero = 20
+    policy.version += 1
+    recovery_environment["db"].commit()
+
+    rejected = recovery_environment["client"].post(
+        "/api/v1/auth/recovery/reset-password",
+        json={"token": token, "password": "NuevaPassword123!*"},
+    )
+    assert rejected.status_code == 422
+    assert "20 caracteres" in rejected.json()["detail"]
+    record = recovery_environment["db"].scalar(
+        select(RecuperacionCuenta).where(RecuperacionCuenta.token_hash == hash_token(token))
+    )
+    assert record is not None and record.utilizado is False
 
 
 def test_recovery_invalidates_mfa_codes_vault_sessions_and_pending_challenges(recovery_environment):

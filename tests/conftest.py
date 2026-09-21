@@ -46,7 +46,7 @@ def _assert_disposable_postgres_target() -> None:
 from app.core import database
 from app.core.database import Base
 from app.core.seed import seed_database
-from app.models import auth, mfa, vault  # noqa: F401
+from app.models import auth, mfa, policy, vault  # noqa: F401
 from app.services.mfa_service import mfa_login_rate_limiter
 
 

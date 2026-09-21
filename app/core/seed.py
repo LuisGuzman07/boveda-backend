@@ -7,6 +7,8 @@ from sqlalchemy import select
 from app.core.database import SessionLocal
 from app.core.security import get_password_hash
 from app.models.auth import Permiso, Rol, Usuario
+from app.models.policy import PoliticaSeguridad
+from app.services.policy_service import POLICY_DEFINITIONS
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,25 @@ def _demo_accounts_from_environment() -> list[dict[str, str]]:
     ]
 
 
+def seed_security_policies(db) -> None:
+    """Creates the fixed policy catalog without overwriting operator-managed values."""
+    for code, definition in POLICY_DEFINITIONS.items():
+        policy = db.scalars(
+            select(PoliticaSeguridad).where(PoliticaSeguridad.codigo == code)
+        ).first()
+        if not policy:
+            db.add(
+                PoliticaSeguridad(
+                    id_politica=uuid.uuid4(),
+                    codigo=code,
+                    tipo_valor="INTEGER",
+                    valor_entero=definition.default,
+                    activa=True,
+                    version=1,
+                )
+            )
+
+
 def seed_database() -> None:
     """Seeds roles and permissions; demo accounts are opt-in external configuration."""
     db = SessionLocal()
@@ -64,6 +85,8 @@ def seed_database() -> None:
             ("devices:approve", "Aprobar Dispositivos", "Permite aprobar identidades de dispositivo verificadas"),
             ("audit:read", "Consultar Auditoría", "Permite ver logs y eventos de auditoría"),
             ("audit:export", "Exportar Auditoría", "Permite exportar reportes de seguridad"),
+            ("policies:read", "Consultar Políticas", "Permite consultar políticas globales de seguridad"),
+            ("policies:write", "Actualizar Políticas", "Permite actualizar políticas globales de seguridad"),
         ]
         permissions = {}
         for code, name, description in permissions_data:
@@ -116,6 +139,8 @@ def seed_database() -> None:
             else:
                 role.permisos = role_permissions
             roles[name] = role
+
+        seed_security_policies(db)
 
         for account in _demo_accounts_from_environment():
             user = db.scalars(

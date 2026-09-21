@@ -445,6 +445,36 @@ class AuthRepository:
         self.db.refresh(session)
         return session
 
+    def revoke_session_capabilities(self, session: Sesion, motivo: str) -> bool:
+        """Revokes one refresh-backed session and its vault capabilities without committing."""
+        now = datetime.now(timezone.utc)
+        revoked = self.db.execute(
+            update(Sesion)
+            .where(Sesion.id_sesion == session.id_sesion, Sesion.revocada.is_(False))
+            .values(revocada=True, motivo_revocacion=motivo, ultima_actividad=now)
+        )
+        if revoked.rowcount != 1:
+            return False
+        self.db.execute(
+            update(SesionBoveda)
+            .where(SesionBoveda.id_sesion == session.id_sesion, SesionBoveda.revocada.is_(False))
+            .values(revocada=True, motivo_revocacion=motivo)
+        )
+        return True
+
+    def touch_web_session(self, session: Sesion, security_version: int) -> bool:
+        """Records activity only while the server-side web session remains current."""
+        touched = self.db.execute(
+            update(Sesion)
+            .where(
+                Sesion.id_sesion == session.id_sesion,
+                Sesion.revocada.is_(False),
+                Sesion.version_seguridad == security_version,
+            )
+            .values(ultima_actividad=datetime.now(timezone.utc))
+        )
+        return touched.rowcount == 1
+
     def revoke_user_security_state(
         self,
         user_id: uuid.UUID,

@@ -4,7 +4,7 @@ from typing import List, Optional
 import secrets
 import uuid
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -30,6 +30,7 @@ from app.schemas.auth import (
     RegistroUsuarioRequest,
     UsuarioRead,
 )
+from app.services.policy_service import PolicyService
 
 
 security_scheme = HTTPBearer(auto_error=True)
@@ -75,6 +76,7 @@ class AuthService:
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
     ) -> UsuarioRead:
+        PolicyService(self.db).validate_password_length(request.password)
         existing_user = self.repo.get_user_by_email(request.correo)
         if existing_user:
             self.repo.create_audit_event(
@@ -154,6 +156,10 @@ class AuthService:
         if not user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas.")
 
+        policy_service = PolicyService(self.db)
+        max_failed_attempts = policy_service.get_effective_value("MAX_FAILED_LOGIN_ATTEMPTS")
+        lockout_duration_minutes = policy_service.get_effective_value("LOCKOUT_DURATION_MINUTES")
+
         locked_until = _as_utc(user.bloqueado_hasta)
         if locked_until and locked_until > now:
             self.repo.create_audit_event(
@@ -187,8 +193,8 @@ class AuthService:
         security_version = user.version_seguridad
         if not verify_password(request.password, user.password_hash):
             user.intentos_fallidos += 1
-            if user.intentos_fallidos >= settings.MAX_FAILED_LOGIN_ATTEMPTS:
-                user.bloqueado_hasta = now + timedelta(minutes=settings.LOCKOUT_DURATION_MINUTES)
+            if user.intentos_fallidos >= max_failed_attempts:
+                user.bloqueado_hasta = now + timedelta(minutes=lockout_duration_minutes)
                 user.estado = "BLOQUEADO"
             self.repo.update_user(user)
             self.repo.create_audit_event(
@@ -200,7 +206,7 @@ class AuthService:
                 user_agent=user_agent,
                 detalles={"intentos": user.intentos_fallidos},
             )
-            if user.intentos_fallidos >= settings.MAX_FAILED_LOGIN_ATTEMPTS:
+            if user.intentos_fallidos >= max_failed_attempts:
                 raise HTTPException(
                     status_code=status.HTTP_423_LOCKED,
                     detail="Demasiados intentos fallidos. Cuenta bloqueada temporalmente.",
@@ -332,14 +338,37 @@ class AuthService:
             "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         }
 
-    def refresh_web(self, refresh_token: str, csrf_token: Optional[str]) -> IssuedSession:
-        return self._refresh(refresh_token, "WEB", csrf_token)
+    def refresh_web(
+        self,
+        refresh_token: str,
+        csrf_token: Optional[str],
+        client_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> IssuedSession:
+        return self._refresh(
+            refresh_token,
+            "WEB",
+            csrf_token,
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+
+    @staticmethod
+    def _require_web_csrf(session: Sesion, csrf_token: Optional[str]) -> None:
+        if (
+            not csrf_token
+            or not session.csrf_hash
+            or not secrets.compare_digest(hash_token(csrf_token), session.csrf_hash)
+        ):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validación CSRF inválida.")
 
     def _refresh(
         self,
         refresh_token: str,
         client_type: str,
         csrf_token: Optional[str] = None,
+        client_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
     ) -> IssuedSession:
         payload = decode_token(refresh_token)
         claims = self._parse_refresh_claims(payload)
@@ -365,12 +394,16 @@ class AuthService:
             self.repo.revoke_refresh_family(session.familia_refresh_id, "SESION_INVALIDA")
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión expirada o revocada.")
 
-        if client_type == "WEB" and (
-            not csrf_token
-            or not session.csrf_hash
-            or not secrets.compare_digest(hash_token(csrf_token), session.csrf_hash)
-        ):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validación CSRF inválida.")
+        if client_type == "WEB":
+            self._require_web_csrf(session, csrf_token)
+        if client_type == "WEB":
+            self._enforce_web_session_inactivity(
+                user,
+                device,
+                session,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
 
         presented_hash = hash_token(refresh_token)
         if session.refresh_jti != claims["jti"] or not secrets.compare_digest(
@@ -510,10 +543,101 @@ class AuthService:
                 detalles={"cliente": "WEB"},
             )
 
+    def _enforce_web_session_inactivity(
+        self,
+        user: Usuario,
+        device: Dispositivo,
+        session: Sesion,
+        *,
+        client_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> None:
+        if session.tipo_cliente != "WEB":
+            return
+        timeout_minutes = PolicyService(self.db).get_effective_value(
+            "INACTIVITY_TIMEOUT_MINUTES"
+        )
+        now = datetime.now(timezone.utc)
+        last_activity = _as_utc(session.ultima_actividad) or _as_utc(session.fecha_inicio)
+        if last_activity and last_activity + timedelta(minutes=timeout_minutes) > now:
+            if not self.repo.touch_web_session(session, user.version_seguridad):
+                self.db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Sesión expirada o revocada.",
+                )
+            self.db.commit()
+            return
 
-def get_current_auth_context(
-    auth_header: HTTPAuthorizationCredentials = Depends(security_scheme),
-    db: Session = Depends(get_db),
+        changed = self.repo.revoke_session_capabilities(session, "BLOQUEO_INACTIVIDAD")
+        if changed:
+            self.repo.add_audit_event(
+                accion="BLOQUEO_INACTIVIDAD",
+                tipo_evento="SEGURIDAD",
+                resultado="EXITO",
+                user_id=user.id_usuario,
+                device_id=device.id_dispositivo,
+                ip=client_ip,
+                user_agent=user_agent,
+                detalles={"origen": "VALIDACION_SERVIDOR", "timeout_minutos": timeout_minutes},
+            )
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="La sesión web fue bloqueada por inactividad.",
+        )
+
+    def lock_web_session_for_inactivity(
+        self,
+        context: AuthenticatedSession,
+        csrf_token: Optional[str],
+        *,
+        client_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> bool:
+        user, device, session = self.repo.lock_authenticated_session(
+            context.user.id_usuario,
+            context.device.id_dispositivo,
+            context.session.id_sesion,
+        )
+        if session.tipo_cliente != "WEB":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="El bloqueo por inactividad sólo está disponible para sesiones web.",
+            )
+        self._require_web_csrf(session, csrf_token)
+        changed = self.repo.revoke_session_capabilities(session, "BLOQUEO_INACTIVIDAD")
+        if not changed:
+            self.db.rollback()
+            return False
+        self.repo.add_audit_event(
+            accion="BLOQUEO_INACTIVIDAD",
+            tipo_evento="SEGURIDAD",
+            resultado="EXITO",
+            user_id=user.id_usuario,
+            device_id=device.id_dispositivo,
+            ip=client_ip,
+            user_agent=user_agent,
+            detalles={"origen": "CLIENTE_WEB"},
+        )
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        return True
+
+
+def _get_current_auth_context(
+    request: Request,
+    auth_header: HTTPAuthorizationCredentials,
+    db: Session,
+    *,
+    enforce_inactivity: bool,
 ) -> AuthenticatedSession:
     payload = decode_token(auth_header.credentials)
     if not payload or payload.get("type") != "access":
@@ -551,7 +675,33 @@ def get_current_auth_context(
         or device.estado == "REVOKED"
     ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión expirada o revocada.")
-    return AuthenticatedSession(user=user, session=session, device=device, payload=payload)
+    context = AuthenticatedSession(user=user, session=session, device=device, payload=payload)
+    if enforce_inactivity:
+        AuthService(db)._enforce_web_session_inactivity(
+            user,
+            device,
+            session,
+            client_ip=request.client.host if request.client else "unknown",
+            user_agent=request.headers.get("User-Agent", "Desconocido"),
+        )
+    return context
+
+
+def get_current_auth_context(
+    request: Request,
+    auth_header: HTTPAuthorizationCredentials = Depends(security_scheme),
+    db: Session = Depends(get_db),
+) -> AuthenticatedSession:
+    return _get_current_auth_context(request, auth_header, db, enforce_inactivity=True)
+
+
+def get_current_auth_context_for_inactivity_lock(
+    request: Request,
+    auth_header: HTTPAuthorizationCredentials = Depends(security_scheme),
+    db: Session = Depends(get_db),
+) -> AuthenticatedSession:
+    # The lock action must not refresh activity immediately before revoking the session.
+    return _get_current_auth_context(request, auth_header, db, enforce_inactivity=False)
 
 
 def get_current_user(

@@ -20,6 +20,7 @@ from app.schemas.recovery import (
     ValidateTokenResponse,
 )
 from app.services.email_service import send_recovery_email
+from app.services.policy_service import PolicyService
 
 
 logger = logging.getLogger(__name__)
@@ -203,6 +204,8 @@ class RecoveryService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Usuario no encontrado.",
             )
+
+        PolicyService(self.db).validate_password_length(data.password)
 
         if verify_password(data.password, user.password_hash):
             raise HTTPException(

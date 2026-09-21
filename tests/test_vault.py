@@ -21,6 +21,7 @@ from app.core.security import get_jwt_secret
 from app.main import app
 from app.models.auth import Dispositivo, EventoAuditoria, Sesion, SesionBoveda, Usuario
 from app.models.mfa import AutenticadorMfa
+from app.models.policy import PoliticaSeguridad
 from app.models.vault import Boveda, ClaveEnvuelta, MembresiaBoveda
 from app.services.totp_secret_service import store_encrypted_totp_secret
 from tests.helpers.device_identity import (
@@ -227,6 +228,39 @@ def test_vault_requires_mfa_trusted_identity_and_one_time_proof():
         assert db.scalars(select(Boveda)).first() is not None
     finally:
         db.close()
+
+
+def test_vault_session_duration_uses_the_current_policy_and_rejects_stale_capabilities():
+    db = SessionLocal()
+    try:
+        policy = db.scalars(
+            select(PoliticaSeguridad).where(
+                PoliticaSeguridad.codigo == "VAULT_SESSION_DURATION_MINUTES"
+            )
+        ).first()
+        assert policy is not None
+        policy.valor_entero = 1
+        policy.version += 1
+        db.commit()
+    finally:
+        db.close()
+
+    identity = new_device_identity()
+    vault, _, _, vault_signing_key = _vault_session(identity)
+    assert vault["expires_in"] == 60
+
+    db = SessionLocal()
+    try:
+        vault_session = db.scalars(select(SesionBoveda)).first()
+        assert vault_session is not None
+        vault_session.fecha_creacion = datetime.now(timezone.utc) - timedelta(minutes=2)
+        db.commit()
+    finally:
+        db.close()
+
+    assert _signed_request(
+        vault_signing_key, vault["access_token"], "GET", "/api/v1/vaults"
+    ).status_code == 401
 
 
 def test_vault_preserves_idempotency_and_rejects_invalid_bound_envelopes():
