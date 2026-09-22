@@ -27,7 +27,7 @@ if os.getenv("CU06_TEST_POSTGRES") != "1":
 from app.core import database
 from app.core.database import Base
 from app.core.seed import seed_database
-from app.models import auth, compliance_report, mfa, vault  # noqa: F401
+from app.models import anomaly, auth, compliance_report, mfa, vault  # noqa: F401
 from app.services.mfa_service import mfa_login_rate_limiter
 
 

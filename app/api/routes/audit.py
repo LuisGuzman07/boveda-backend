@@ -7,7 +7,7 @@ from app.core.database import get_db
 from app.models.auth import Usuario
 from app.schemas.audit import AuditListResponse, AuditStatsResponse
 from app.schemas.compliance_report import ComplianceReportCreate, ComplianceReportRead
-from app.schemas.anomaly import AnomalyRunRead, ChainVerificationRead
+from app.schemas.anomaly import AnomalyFindingRead, AnomalyRunRead, AnomalyStatsRead, ChainVerificationRead
 from app.services.auth_service import get_current_user
 from app.services.audit_service import AuditService
 from app.services.anomaly_service import AnomalyService
@@ -93,6 +93,16 @@ def create_anomaly_run(current_user: Usuario = Depends(verify_audit_permission),
 @router.get("/anomalies/runs", response_model=list[AnomalyRunRead], summary="Listar análisis locales de anomalías")
 def list_anomaly_runs(current_user: Usuario = Depends(verify_audit_permission), db: Session = Depends(get_db)):
     return AnomalyService(db).list_runs()
+
+
+@router.get("/anomalies/latest", response_model=Optional[AnomalyRunRead], summary="Consultar el análisis local más reciente")
+def get_latest_anomaly_run(current_user: Usuario = Depends(verify_audit_permission), db: Session = Depends(get_db)):
+    return AnomalyService(db).get_latest_run()
+
+
+@router.get("/anomalies/stats", response_model=AnomalyStatsRead, summary="Consultar métricas y estadísticas del motor de IA")
+def get_anomaly_stats(current_user: Usuario = Depends(verify_audit_permission), db: Session = Depends(get_db)):
+    return AnomalyService(db).get_stats()
 
 
 @router.get("/anomalies/runs/{run_id}", response_model=AnomalyRunRead, summary="Consultar análisis local de anomalías")

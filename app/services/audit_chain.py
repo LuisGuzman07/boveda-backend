@@ -34,6 +34,8 @@ def redact_audit_details(value: Any, key: str = "") -> Any:
 
 def _normalise(value: Any) -> Any:
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return str(value) if value is not None else None
 
