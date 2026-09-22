@@ -128,6 +128,20 @@ class FileService:
         else:
             total = self.repo.count_metadata(vault_id)
             rows = self.repo.list_metadata(vault_id, (page - 1) * page_size, page_size, user.id_usuario, device.id_dispositivo)
+
+        version_ids = [row[0].id_version_archivo for row in rows]
+        s3_replicas = {}
+        if version_ids:
+            from sqlalchemy import select
+            s3_rows = self.db.scalars(
+                select(ReplicaAlmacenamiento).where(
+                    ReplicaAlmacenamiento.id_version_archivo.in_(version_ids),
+                    ReplicaAlmacenamiento.proveedor == "S3",
+                )
+            ).all()
+            for rep in s3_rows:
+                s3_replicas[rep.id_version_archivo] = rep
+
         items = []
         for row in rows:
             version, archivo, replica = row[0], row[1], row[2]
@@ -140,6 +154,7 @@ class FileService:
                     "nonce": clave.nonce,
                     "tag": clave.tag,
                 }
+            s3_rep = s3_replicas.get(version.id_version_archivo)
             items.append({
                 "id_archivo": version.id_archivo,
                 "id_version_archivo": version.id_version_archivo,
@@ -154,6 +169,9 @@ class FileService:
                 "proveedor": replica.proveedor if replica else None,
                 "estado_replica": replica.estado if replica else None,
                 "fecha_verificacion_replica": replica.fecha_verificacion if replica else None,
+                "s3_estado": s3_rep.estado if s3_rep else None,
+                "s3_version_id": s3_rep.version_id if s3_rep else None,
+                "s3_fecha_verificacion": s3_rep.fecha_verificacion if s3_rep else None,
                 "clave_archivo_envuelta": wrapped_envelope,
             })
         return {

@@ -21,13 +21,15 @@ os.environ["SEED_ADMIN_PASSWORD"] = "Admin1234!*"
 os.environ["SEED_MEMBER_NAME"] = "Miembro de Pruebas"
 os.environ["SEED_MEMBER_EMAIL"] = "investigador@boveda.com"
 os.environ["SEED_MEMBER_PASSWORD"] = "User1234!*"
+os.environ["SESSION_COOKIE_SECURE"] = "true"
 if os.getenv("CU06_TEST_POSTGRES") != "1":
     os.environ["DATABASE_URL"] = "sqlite://"
 
 from app.core import database
 from app.core.database import Base
 from app.core.seed import seed_database
-from app.models import anomaly, auth, compliance_report, mfa, vault  # noqa: F401
+from app.models import anomaly, auth, compliance_report, mfa, policy, vault  # noqa: F401
+from app.models.policy import PoliticaSeguridad
 from app.services.mfa_service import mfa_login_rate_limiter
 
 
@@ -54,11 +56,31 @@ database.engine = test_engine
 database.SessionLocal.configure(bind=test_engine)
 
 
+def _seed_test_policies():
+    db = database.SessionLocal()
+    try:
+        defaults = [
+            {"codigo": "INACTIVITY_TIMEOUT_MINUTES", "nombre": "Tiempo de Inactividad para Bloqueo (CU-12)", "valor": "15", "descripcion": "Minutos de inactividad...", "activa": True},
+            {"codigo": "MAX_FAILED_LOGIN_ATTEMPTS", "nombre": "Intentos Fallidos de Inicio de Sesión", "valor": "5", "descripcion": "Número máximo de intentos...", "activa": True},
+            {"codigo": "LOCKOUT_DURATION_MINUTES", "nombre": "Duración de Bloqueo de Cuenta", "valor": "15", "descripcion": "Duración en minutos...", "activa": True},
+            {"codigo": "VAULT_SESSION_DURATION_MINUTES", "nombre": "Duración de Sesión de Bóvedas", "valor": "15", "descripcion": "Vigencia en minutos...", "activa": True},
+            {"codigo": "AUDIT_RETENTION_DAYS", "nombre": "Retención de Auditoría Inmutable", "valor": "90", "descripcion": "Días mínimos de retención...", "activa": True},
+            {"codigo": "PASSWORD_MIN_LENGTH", "nombre": "Longitud Mínima de Contraseña", "valor": "12", "descripcion": "Longitud mínima de caracteres...", "activa": True},
+        ]
+        import uuid
+        for item in defaults:
+            db.add(PoliticaSeguridad(id_politica=uuid.uuid4(), **item))
+        db.commit()
+    finally:
+        db.close()
+
+
 @pytest.fixture(autouse=True)
 def isolated_database():
     Base.metadata.drop_all(test_engine)
     Base.metadata.create_all(test_engine)
     seed_database()
+    _seed_test_policies()
     mfa_login_rate_limiter._attempts.clear()
     try:
         yield

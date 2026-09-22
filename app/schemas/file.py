@@ -75,6 +75,9 @@ class FileMetadataResponse(BaseModel):
     proveedor: str | None = None
     estado_replica: str | None = None
     fecha_verificacion_replica: datetime | None = None
+    s3_estado: str | None = None
+    s3_version_id: str | None = None
+    s3_fecha_verificacion: datetime | None = None
     clave_archivo_envuelta: EncryptedFileEnvelope | None = None
 
 
