@@ -124,12 +124,22 @@ class FileService:
 
         if grant and grant.id_archivo:
             total = self.repo.count_metadata_for_file(vault_id, grant.id_archivo)
-            rows = self.repo.list_metadata_for_file(vault_id, grant.id_archivo, (page - 1) * page_size, page_size)
+            rows = self.repo.list_metadata_for_file(vault_id, grant.id_archivo, (page - 1) * page_size, page_size, user.id_usuario, device.id_dispositivo)
         else:
             total = self.repo.count_metadata(vault_id)
-            rows = self.repo.list_metadata(vault_id, (page - 1) * page_size, page_size)
+            rows = self.repo.list_metadata(vault_id, (page - 1) * page_size, page_size, user.id_usuario, device.id_dispositivo)
         items = []
-        for version, archivo, replica in rows:
+        for row in rows:
+            version, archivo, replica = row[0], row[1], row[2]
+            clave = row[3] if len(row) > 3 else None
+            wrapped_envelope = None
+            if clave:
+                wrapped_envelope = {
+                    "algoritmo": clave.algoritmo,
+                    "ciphertext": clave.ciphertext,
+                    "nonce": clave.nonce,
+                    "tag": clave.tag,
+                }
             items.append({
                 "id_archivo": version.id_archivo,
                 "id_version_archivo": version.id_version_archivo,
@@ -144,6 +154,7 @@ class FileService:
                 "proveedor": replica.proveedor if replica else None,
                 "estado_replica": replica.estado if replica else None,
                 "fecha_verificacion_replica": replica.fecha_verificacion if replica else None,
+                "clave_archivo_envuelta": wrapped_envelope,
             })
         return {
             "items": items,

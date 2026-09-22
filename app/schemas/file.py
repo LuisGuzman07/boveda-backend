@@ -75,6 +75,7 @@ class FileMetadataResponse(BaseModel):
     proveedor: str | None = None
     estado_replica: str | None = None
     fecha_verificacion_replica: datetime | None = None
+    clave_archivo_envuelta: EncryptedFileEnvelope | None = None
 
 
 class FileMetadataListResponse(BaseModel):

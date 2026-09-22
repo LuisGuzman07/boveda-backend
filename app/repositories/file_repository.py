@@ -44,17 +44,30 @@ class FileRepository:
             )
         ) or 0
 
-    def list_metadata(self, vault_id, offset, limit):
+    def list_metadata(self, vault_id, offset, limit, user_id=None, device_id=None):
+        clave_conds = [
+            ClaveEnvuelta.id_version_archivo == VersionArchivo.id_version_archivo,
+            ClaveEnvuelta.estado == "ACTIVA",
+        ]
+        if user_id:
+            clave_conds.append(ClaveEnvuelta.id_usuario == user_id)
+        if device_id:
+            clave_conds.append(ClaveEnvuelta.id_dispositivo == device_id)
+
         statement = (
-            select(VersionArchivo, Archivo, ReplicaAlmacenamiento)
+            select(VersionArchivo, Archivo, ReplicaAlmacenamiento, ClaveEnvuelta)
             .join(Archivo, Archivo.id_archivo == VersionArchivo.id_archivo)
             .join(Boveda, Boveda.id_boveda == VersionArchivo.id_boveda)
             .outerjoin(
                 ReplicaAlmacenamiento,
                 and_(
                     ReplicaAlmacenamiento.id_version_archivo == VersionArchivo.id_version_archivo,
-                ReplicaAlmacenamiento.proveedor == "MINIO",
+                    ReplicaAlmacenamiento.proveedor == "MINIO",
                 ),
+            )
+            .outerjoin(
+                ClaveEnvuelta,
+                and_(*clave_conds),
             )
             .where(
                 VersionArchivo.id_boveda == vault_id,
@@ -75,8 +88,40 @@ class FileRepository:
     def count_metadata_for_file(self, vault_id, file_id):
         return self.db.scalar(select(func.count(VersionArchivo.id_version_archivo)).join(Archivo, Archivo.id_archivo == VersionArchivo.id_archivo).where(VersionArchivo.id_boveda == vault_id, VersionArchivo.id_archivo == file_id, Archivo.estado == "ACTIVO")) or 0
 
-    def list_metadata_for_file(self, vault_id, file_id, offset, limit):
-        return self.db.execute(select(VersionArchivo, Archivo, ReplicaAlmacenamiento).join(Archivo, Archivo.id_archivo == VersionArchivo.id_archivo).outerjoin(ReplicaAlmacenamiento, and_(ReplicaAlmacenamiento.id_version_archivo == VersionArchivo.id_version_archivo, ReplicaAlmacenamiento.proveedor == "MINIO")).where(VersionArchivo.id_boveda == vault_id, VersionArchivo.id_archivo == file_id, Archivo.estado == "ACTIVO").order_by(VersionArchivo.numero_version.desc(), VersionArchivo.id_version_archivo.asc()).offset(offset).limit(limit)).all()
+    def list_metadata_for_file(self, vault_id, file_id, offset, limit, user_id=None, device_id=None):
+        clave_conds = [
+            ClaveEnvuelta.id_version_archivo == VersionArchivo.id_version_archivo,
+            ClaveEnvuelta.estado == "ACTIVA",
+        ]
+        if user_id:
+            clave_conds.append(ClaveEnvuelta.id_usuario == user_id)
+        if device_id:
+            clave_conds.append(ClaveEnvuelta.id_dispositivo == device_id)
+
+        statement = (
+            select(VersionArchivo, Archivo, ReplicaAlmacenamiento, ClaveEnvuelta)
+            .join(Archivo, Archivo.id_archivo == VersionArchivo.id_archivo)
+            .outerjoin(
+                ReplicaAlmacenamiento,
+                and_(
+                    ReplicaAlmacenamiento.id_version_archivo == VersionArchivo.id_version_archivo,
+                    ReplicaAlmacenamiento.proveedor == "MINIO",
+                ),
+            )
+            .outerjoin(
+                ClaveEnvuelta,
+                and_(*clave_conds),
+            )
+            .where(
+                VersionArchivo.id_boveda == vault_id,
+                VersionArchivo.id_archivo == file_id,
+                Archivo.estado == "ACTIVO",
+            )
+            .order_by(VersionArchivo.numero_version.desc(), VersionArchivo.id_version_archivo.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        return self.db.execute(statement).all()
 
     def get_download(self, vault_id, version_id, user_id, device_id):
         statement = (

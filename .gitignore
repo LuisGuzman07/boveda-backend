@@ -46,6 +46,7 @@ htmlcov/
 
 # Docker volumes & local data
 postgres_data/
+storage/
 
 # OS generated
 .DS_Store
