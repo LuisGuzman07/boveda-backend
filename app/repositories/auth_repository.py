@@ -105,6 +105,8 @@ class AuthRepository:
                         detail="La clave de firma CU06 no coincide con la registrada para este dispositivo.",
                     )
                 device.clave_firma_boveda = vault_public_key
+            elif not device.clave_firma_boveda and device.public_key:
+                device.clave_firma_boveda = device.public_key
         else:
             public_key = None
             fingerprint = None
@@ -113,6 +115,8 @@ class AuthRepository:
                 public_key, fingerprint = self._normalize_device_key(info.public_key)
             if info.vault_public_key:
                 vault_public_key, _ = self._normalize_device_key(info.vault_public_key)
+            else:
+                vault_public_key = public_key
             device = Dispositivo(
                 id_usuario=user_id,
                 nombre=info.nombre,

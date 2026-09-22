@@ -10,7 +10,7 @@ class EncryptedFileEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     algoritmo: str = Field(default="AES-256-GCM", pattern="^AES-256-GCM$")
-    ciphertext: str = Field(min_length=24)
+    ciphertext: str = Field(min_length=1)
     nonce: str = Field(min_length=16, max_length=32)
     tag: str = Field(min_length=20, max_length=32)
 
@@ -35,7 +35,7 @@ class FileUploadRequest(BaseModel):
     nombre_cifrado: EncryptedFileEnvelope
     contenido_cifrado: EncryptedFileEnvelope
     clave_archivo_envuelta: EncryptedFileEnvelope
-    tamano_cifrado: int = Field(gt=16, le=100 * 1024 * 1024)
+    tamano_cifrado: int = Field(ge=16, le=100 * 1024 * 1024)
     hash_cifrado: str = Field(min_length=64, max_length=64, pattern="^[0-9a-fA-F]{64}$")
 
     @field_validator("contenido_cifrado")

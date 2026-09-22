@@ -91,6 +91,10 @@ class AuthService:
             )
 
         default_role = self.repo.get_role_by_name("Miembro")
+        if not default_role:
+            from app.core.seed import seed_database
+            seed_database()
+            default_role = self.repo.get_role_by_name("Miembro")
         roles = [default_role] if default_role else []
         new_user = self.repo.create_user(
             nombre=request.nombre,
@@ -213,10 +217,16 @@ class AuthService:
 
         user.intentos_fallidos = 0
         user.bloqueado_hasta = None
-        user.ultimo_acceso = now
-        if user.estado == "BLOQUEADO":
-            user.estado = "ACTIVO"
-        self.repo.update_user(user)
+        if not user.roles:
+            default_role = self.repo.get_role_by_name("Miembro")
+            if not default_role:
+                from app.core.seed import seed_database
+                seed_database()
+                default_role = self.repo.get_role_by_name("Miembro")
+            if default_role:
+                user.roles.append(default_role)
+                self.db.commit()
+                self.db.refresh(user)
 
         device_info = request.dispositivo or DispositivoInfo()
         device = self.repo.get_or_create_device(user.id_usuario, device_info)
