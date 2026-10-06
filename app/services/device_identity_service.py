@@ -189,6 +189,8 @@ class DeviceIdentityService:
         if purpose == CHALLENGE_ENROLLMENT:
             device.estado = DEVICE_TRUSTED
             device.es_confiable = True
+            if not device.clave_firma_boveda and device.public_key:
+                device.clave_firma_boveda = device.public_key
             device.identidad_verificada_en = now
             device.confianza_otorgada_en = now
             device.ultimo_acceso = now

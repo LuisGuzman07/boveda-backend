@@ -79,6 +79,15 @@ def test_mfa_full_lifecycle():
     assert "access_token" in final_auth
     assert final_auth["usuario"]["correo"] == email
 
+    # 8b. Probar renovación de verificación MFA de la sesión activa
+    renew_mfa_res = client.post(
+        "/api/v1/auth/mfa/verify-session",
+        headers={"Authorization": f"Bearer {final_auth['access_token']}"},
+        json={"code": totp.now()},
+    )
+    assert renew_mfa_res.status_code == 200
+    assert renew_mfa_res.json()["status"] == "ok"
+
     # 9. Desactivar MFA para dejar el usuario limpio
     disable_res = client.post(
         "/api/v1/auth/mfa/disable",

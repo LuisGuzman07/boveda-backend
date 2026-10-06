@@ -11,7 +11,11 @@ from app.schemas.mfa import (
     MfaStatusResponse,
     MfaVerifyLoginRequest,
 )
-from app.services.auth_service import get_current_user
+from app.services.auth_service import (
+    AuthenticatedSession,
+    get_current_auth_context,
+    get_current_user,
+)
 from app.services.mfa_service import MfaService
 
 router = APIRouter(prefix="/auth/mfa", tags=["MFA (Doble Factor)"])
@@ -95,3 +99,23 @@ def get_mfa_status(
 ):
     service = MfaService(db)
     return service.get_status(current_user)
+
+
+@router.post(
+    "/verify-session",
+    summary="CU-02: Renovar verificación MFA para la sesión activa",
+    description="Valida el código TOTP de 6 dígitos o código de respaldo y renueva el sello MFA de la sesión.",
+)
+def verify_session_mfa(
+    request: Request,
+    body: MfaEnableRequest,
+    context: AuthenticatedSession = Depends(get_current_auth_context),
+    db: Session = Depends(get_db),
+):
+    service = MfaService(db)
+    client_ip = get_client_ip(request)
+    user_agent = request.headers.get("User-Agent", "Desconocido")
+    return service.verify_session_mfa(
+        context.user, context.session, body.code, client_ip=client_ip, user_agent=user_agent
+    )
+

@@ -346,3 +346,63 @@ class MfaService:
                 registered_at=mfa.fecha_registro,
             )
         return MfaStatusResponse(enabled=False, mfa_enabled=False)
+
+    def verify_session_mfa(
+        self,
+        user: Usuario,
+        session,
+        code: str,
+        client_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> dict:
+        """Valida el código TOTP y renueva el estado de verificación MFA para la sesión activa."""
+        mfa = self.mfa_repo.get_active_mfa(user.id_usuario)
+        if not mfa:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="El usuario no tiene MFA activo configurado.",
+            )
+
+        code_input = code.strip()
+        is_valid = False
+        if len(code_input) == 6 and code_input.isdigit():
+            totp = pyotp.TOTP(get_totp_secret(mfa))
+            if totp.verify(code_input, valid_window=1):
+                is_valid = True
+                mfa.ultimo_uso = datetime.now(timezone.utc)
+                self.mfa_repo.save_mfa(mfa)
+
+        if not is_valid:
+            if self.mfa_repo.verify_and_consume_recovery_code(user.id_usuario, code_input):
+                is_valid = True
+
+        if not is_valid:
+            self.auth_repo.create_audit_event(
+                accion="VERIFICACION_MFA_SESION_FALLIDA",
+                tipo_evento="SEGURIDAD_MFA",
+                resultado="FALLO",
+                user_id=user.id_usuario,
+                ip=client_ip,
+                user_agent=user_agent,
+                detalles={"motivo": "Código 2FA incorrecto"},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Código de autenticación incorrecto o expirado.",
+            )
+
+        now = datetime.now(timezone.utc)
+        session.mfa_verificado_en = now
+        session.ultima_actividad = now
+        self.db.add(session)
+        self.db.commit()
+
+        self.auth_repo.create_audit_event(
+            accion="VERIFICACION_MFA_SESION_RENOVADA",
+            tipo_evento="SEGURIDAD_MFA",
+            resultado="EXITO",
+            user_id=user.id_usuario,
+            ip=client_ip,
+            user_agent=user_agent,
+        )
+        return {"status": "ok", "message": "Verificación MFA de la sesión renovada exitosamente."}

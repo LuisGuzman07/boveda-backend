@@ -47,13 +47,14 @@ def active_session(
         reject(401, "Sesión expirada o revocada.")
     if not user or user.estado != "ACTIVO":
         reject(401, "Usuario inactivo.")
+    signing_key = (device.clave_firma_boveda or device.public_key) if device else None
     if (
         not device
         or device.id_usuario != user_id
         or device.estado != "TRUSTED"
         or not device.es_confiable
         or not device.public_key
-        or not device.clave_firma_boveda
+        or not signing_key
     ):
         reject(403, "El dispositivo debe estar TRUSTED y vigente.")
     if not session.mfa_verificado_en:
@@ -174,8 +175,9 @@ async def get_vault_context(
 
     user, device, _ = active_session(db, session_id, user_id, device_id)
     try:
+        signing_key = device.clave_firma_boveda or device.public_key or ""
         verify_ed25519_signature(
-            device.clave_firma_boveda or "", request.headers["X-Vault-Signature"], message
+            signing_key, request.headers["X-Vault-Signature"], message
         )
     except (KeyError, DeviceCryptoError):
         reject(401, "Firma del dispositivo inválida.")

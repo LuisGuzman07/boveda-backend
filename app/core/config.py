@@ -58,10 +58,10 @@ class Settings(BaseSettings):
     # JWT & Authentication
     JWT_SECRET_KEY: SecretStr
     JWT_ALGORITHM: Literal["HS256"] = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 5
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
-    MFA_VAULT_MAX_AGE_MINUTES: int = 5
-    VAULT_SESSION_EXPIRE_MINUTES: int = 5
+    MFA_VAULT_MAX_AGE_MINUTES: int = 60
+    VAULT_SESSION_EXPIRE_MINUTES: int = 15
     DEVICE_CHALLENGE_TTL_SECONDS: int = 120
     SESSION_COOKIE_NAME: str = "boveda_refresh"
     CSRF_COOKIE_NAME: str = "csrf_token"
